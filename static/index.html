@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Document Agent</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+
+<body>
+
+<!-- Mobile sidebar overlay -->
+<div class="sidebar-overlay" id="sidebar-overlay"></div>
+
+<div class="app-layout">
+
+    <!-- ================================================
+         SIDEBAR — Upload + Document List
+         ================================================ -->
+    <div class="sidebar" id="sidebar">
+
+        <div class="sidebar-header">
+            <div class="logo-icon">&#9889;</div>
+            <div>
+                <h1>DocAgent</h1>
+                <p>PDF Analysis with AI</p>
+            </div>
+        </div>
+
+        <div class="upload-section">
+
+            <div
+                class="upload-zone"
+                id="upload-zone"
+                onclick="document.getElementById('file-input').click()"
+            >
+                <div class="upload-icon">&#128206;</div>
+                <div class="upload-text">
+                    <strong>Drop files here</strong>
+                    PDF, DOCX, TXT, CSV
+                </div>
+            </div>
+
+            <input
+                type="file"
+                id="file-input"
+                accept=".pdf,.docx,.txt,.csv"
+                multiple
+            >
+
+            <div class="upload-progress" id="upload-progress">
+                <div class="progress-bar">
+                    <div class="progress-fill"></div>
+                </div>
+                <div class="progress-text" id="progress-text">
+                    Processing...
+                </div>
+            </div>
+
+        </div>
+
+        <div class="doc-list-section" id="doc-list-section">
+            <div class="doc-list-header">
+                Documents
+                (<span id="doc-count">0</span>)
+            </div>
+
+            <div id="doc-list">
+                <div class="doc-empty">
+                    No documents uploaded yet.<br>
+                    Upload a file to get started.
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ================================================
+         CHAT AREA
+         ================================================ -->
+    <div class="chat-area">
+
+        <!-- Top bar -->
+        <div class="chat-header">
+            <button class="hamburger-btn" id="hamburger-btn"
+                    title="Open sidebar">
+                &#9776;
+            </button>
+            <div class="status-dot"></div>
+            <h2>Document Q&A</h2>
+        </div>
+
+        <!-- Blocked overlay -->
+        <div class="chat-blocked" id="chat-blocked">
+            <div class="blocked-icon">&#128196;</div>
+            <h3>Upload a document to start</h3>
+            <p>
+                Analyze financial documents, invoices, bank
+                statements, Form 16, student results, and more.
+                Upload a PDF to begin.
+            </p>
+        </div>
+
+        <!-- Chat messages -->
+        <div
+            class="chat-messages"
+            id="chat-messages"
+            style="display: none;"
+        >
+            <div class="message">
+                <div class="message-inner">
+                    <div class="message-avatar">AI</div>
+                    <div class="message-body">
+                        <div class="message-content">
+                            Your documents are ready. Ask me anything
+                            — summaries, specific data, comparisons,
+                            or analysis.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Input area -->
+        <div class="input-wrapper" id="input-wrapper">
+
+            <!-- Source filter indicator -->
+            <div class="source-filter-row all-docs"
+                 id="source-filter-chip">
+                <span class="chip-dot"></span>
+                <span id="source-filter-label">Searching: All documents</span>
+            </div>
+
+            <!-- Input bar with attach + textarea + send -->
+            <div class="input-bar">
+
+                <button
+                    class="attach-btn"
+                    id="attach-btn"
+                    onclick="document.getElementById('file-input').click()"
+                    title="Attach PDF"
+                    disabled
+                >
+                    <!-- Paperclip SVG -->
+                    <svg viewBox="0 0 24 24" fill="none"
+                         stroke="currentColor" stroke-width="2"
+                         stroke-linecap="round" stroke-linejoin="round"
+                         width="20" height="20">
+                        <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
+                    </svg>
+                </button>
+
+                <textarea
+                    id="question"
+                    placeholder="Upload a PDF first..."
+                    rows="1"
+                    disabled
+                ></textarea>
+
+                <button
+                    class="send-btn"
+                    id="send-btn"
+                    onclick="sendMessage()"
+                    title="Send message"
+                    disabled
+                >
+                    <!-- Arrow-up SVG -->
+                    <svg viewBox="0 0 24 24" fill="none"
+                         stroke="currentColor" stroke-width="2.5"
+                         stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="12" y1="19" x2="12" y2="5"/>
+                        <polyline points="5 12 12 5 19 12"/>
+                    </svg>
+                </button>
+
+                <button
+                    class="stop-btn"
+                    id="stop-btn"
+                    onclick="stopGeneration()"
+                    title="Stop generating"
+                    style="display: none;"
+                >
+                    <!-- Square stop icon -->
+                    <svg viewBox="0 0 24 24" fill="currentColor"
+                         width="16" height="16">
+                        <rect x="6" y="6" width="12" height="12"
+                              rx="2" ry="2"/>
+                    </svg>
+                </button>
+
+            </div>
+
+        </div>
+
+    </div>
+
+</div>
+
+<script src="/static/app.js"></script>
+
+</body>
+
+</html>

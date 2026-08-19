@@ -1,0 +1,31 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Uploaded files and vector database
+uploads/
+chroma_db/
+
+# Environment variables (contains API keys!)
+# NEVER commit this — it has your OpenRouter key
+.env
+
+# IDE / editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# pytest cache
+.pytest_cache/
+
+# OS files
+Thumbs.db
+.DS_Store
