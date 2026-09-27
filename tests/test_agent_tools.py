@@ -8,10 +8,8 @@ What these tests cover:
   2. _sanitize_filename() — path traversal prevention
   3. filter_rows() — CSV filtering logic
   4. aggregate_data() — CSV aggregation logic
-  5. calculator() — edge cases not in test_calculator.py
 
 How to run:
-  cd E:\\ai-document-agent
   uv run pytest tests/ -v
 """
 
@@ -19,7 +17,6 @@ import pytest
 
 from ai_document_agent.agent import (
     _enrich_query,
-    calculator,
 )
 
 
@@ -146,7 +143,9 @@ class TestEnrichQuery:
 # _sanitize_filename() tests
 # ---------------------------------------------------------
 
-from ai_document_agent.main import _sanitize_filename
+from ai_document_agent.shared import (
+    sanitize_filename as _sanitize_filename,
+)
 
 
 class TestSanitizeFilename:
@@ -183,6 +182,13 @@ class TestSanitizeFilename:
         result = _sanitize_filename("  report.pdf  ")
         assert result == "report.pdf"
 
+    def test_dot_dot_alone_is_rejected(self):
+        assert _sanitize_filename("..") == "unnamed_upload"
+        assert _sanitize_filename("../..") == "unnamed_upload"
+
+    def test_mixed_separators(self):
+        assert _sanitize_filename("a\\b/../c\\report.pdf") == "report.pdf"
+
     def test_mixed_traversal(self):
         result = _sanitize_filename(
             "../../../uploads/../../../etc/passwd"
@@ -191,23 +197,72 @@ class TestSanitizeFilename:
 
 
 # ---------------------------------------------------------
-# calculator() edge cases
+# Agent tools: filter_rows() and aggregate_data()
 # ---------------------------------------------------------
+#
+# These are the functions the LLM can call (tool calling)
+# when a question needs exact answers from tabular data.
 
-class TestCalculatorEdgeCases:
-    """Additional calculator tests not in test_calculator."""
+from unittest.mock import patch  # noqa: E402
 
-    def test_very_small_floats(self):
-        result = calculator("add", 0.001, 0.002)
-        assert abs(result - 0.003) < 1e-10
+from ai_document_agent import agent as _agent  # noqa: E402
 
-    def test_negative_division(self):
-        assert calculator("divide", -10, 2) == -5.0
+SAMPLE_CSV = (
+    "name,department,salary\n"
+    "Asha,Engineering,120000\n"
+    "Ravi,Engineering,95000\n"
+    "Meera,Sales,70000\n"
+    "Kabir,Sales,85000\n"
+)
 
-    def test_both_negative(self):
-        assert calculator("multiply", -3, -4) == 12
 
-    def test_divide_produces_float(self):
-        result = calculator("divide", 1, 3)
-        assert isinstance(result, float)
-        assert abs(result - 1/3) < 1e-10
+@pytest.fixture
+def csv_source(tmp_path):
+    path = tmp_path / "staff.csv"
+    path.write_text(SAMPLE_CSV, encoding="utf-8")
+    with patch.object(_agent, "_find_csv_for_source", return_value=path):
+        yield "staff.csv"
+
+
+class TestFilterRows:
+    def test_exact_match_is_case_insensitive(self, csv_source):
+        out = _agent.filter_rows("department", "sales", csv_source)
+        assert "2 rows" in out
+        assert "Meera" in out and "Kabir" in out
+        assert "Asha" not in out
+
+    def test_numeric_comparison(self, csv_source):
+        out = _agent.filter_rows("salary", ">90000", csv_source)
+        assert "Asha" in out and "Ravi" in out
+        assert "Meera" not in out
+
+    def test_unknown_column_lists_available_columns(self, csv_source):
+        out = _agent.filter_rows("age", "30", csv_source)
+        assert out.startswith("Error")
+        assert "salary" in out
+
+    def test_no_match_reports_total_rows(self, csv_source):
+        out = _agent.filter_rows("department", "HR", csv_source)
+        assert "No rows found" in out and "4" in out
+
+    def test_non_tabular_document_returns_guidance(self):
+        with patch.object(_agent, "_find_csv_for_source", return_value=None):
+            out = _agent.filter_rows("x", "y", "notes.txt")
+        assert "only works on tabular data" in out
+
+
+class TestAggregateData:
+    def test_average(self, csv_source):
+        out = _agent.aggregate_data("salary", "average", None, csv_source)
+        assert "92500" in out.replace(",", "")
+
+    def test_sum_grouped_by_department(self, csv_source):
+        out = _agent.aggregate_data(
+            "salary", "sum", "department", csv_source,
+        ).replace(",", "")
+        assert "Engineering" in out and "215000" in out
+        assert "Sales" in out and "155000" in out
+
+    def test_bad_group_by_column(self, csv_source):
+        out = _agent.aggregate_data("salary", "sum", "team", csv_source)
+        assert out.startswith("Error")

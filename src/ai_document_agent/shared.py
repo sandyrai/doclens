@@ -36,6 +36,7 @@
 #
 # ---------------------------------------------------------
 
+import os
 import re
 import uuid
 from pathlib import Path
@@ -69,6 +70,12 @@ MAX_MESSAGES_PER_SESSION = 50
 
 # Maximum upload file size: 20 MB
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+# Trust X-Forwarded-For only when explicitly enabled (see
+# get_client_ip). Off by default so clients can't spoof IPs.
+TRUST_PROXY_HEADERS = os.getenv(
+    "TRUST_PROXY_HEADERS", "false"
+).strip().lower() in {"1", "true", "yes"}
 
 
 # ---------------------------------------------------------
@@ -152,12 +159,17 @@ def get_client_ip(request: Request) -> str:
         role.
     """
 
-    # Check for proxy header first
-    forwarded_for = request.headers.get("x-forwarded-for")
-
-    if forwarded_for:
-        # Take the first IP (the original client)
-        return forwarded_for.split(",")[0].strip()
+    # SECURITY: only trust X-Forwarded-For when the app is
+    # actually behind a reverse proxy you control. Any client
+    # can send this header, so trusting it by default would
+    # let anyone bypass the per-IP rate limits by faking an
+    # IP. Set TRUST_PROXY_HEADERS=true in .env when deployed
+    # behind nginx / Cloudflare / a load balancer.
+    if TRUST_PROXY_HEADERS:
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            # Take the first IP (the original client)
+            return forwarded_for.split(",")[0].strip()
 
     # Direct connection — use the socket's remote address
     if request.client:
@@ -186,11 +198,11 @@ def sanitize_filename(raw_name: str) -> str:
     """
 
     # Take only the final path component — kills
-    # "../../etc/passwd" and "C:\\Windows\\system32\\x"
-    name = Path(raw_name).name
-
-    # Remove any remaining path separators
-    name = name.replace("/", "_").replace("\\", "_")
+    # "../../etc/passwd" and "C:\\Windows\\system32\\x".
+    # Split on BOTH separators ourselves: Path().name only
+    # understands the separator of the OS the server runs
+    # on, so on Linux a Windows path would pass through.
+    name = re.split(r"[\\/]", raw_name)[-1]
 
     # Remove null bytes and other control characters
     name = re.sub(r'[\x00-\x1f]', '', name)
@@ -198,7 +210,8 @@ def sanitize_filename(raw_name: str) -> str:
     # Collapse whitespace
     name = name.strip()
 
-    if not name:
+    # "." and ".." are directory references, not filenames
+    if not name or name in {".", ".."}:
         name = "unnamed_upload"
 
     return name

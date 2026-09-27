@@ -1,61 +1,115 @@
-# AI Document Agent
+# DocLens
 
-Upload PDFs, Word files or spreadsheets and ask questions about them. The agent
-retrieves the relevant passages (hybrid BM25 + vector search), can call data
-tools on extracted tables, and streams the answer back to a web UI.
+**An AI document analysis engine.** Upload PDFs, Word files, spreadsheets or scanned images, then ask questions in plain language. DocLens retrieves the relevant passages with hybrid search, lets the LLM call data tools for exact answers on tables, and streams a grounded answer with its sources back to a web UI or to any app over WebSocket.
 
-**Bring your own LLM.** You can run it fully locally (Ollama, LM Studio) or with any cloud
-model, free or paid: OpenRouter, Google Gemini, Anthropic Claude, OpenAI,
-Groq, or any other OpenAI-compatible endpoint. You switch providers by editing `.env`;
-no code changes are needed.
+It runs fully locally (Ollama, LM Studio) or with any cloud LLM: OpenRouter, Google Gemini, Anthropic Claude, OpenAI, Groq, or any OpenAI-compatible endpoint. Switching providers is a `.env` change; no code changes.
+
+![tests](https://github.com/sandyrai/ai-document-agent/actions/workflows/tests.yml/badge.svg)
+![python](https://img.shields.io/badge/python-3.12-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
+
+---
+
+## Features
+
+**Retrieval-Augmented Generation (RAG)**
+- Ingests **PDF, DOCX, TXT, CSV and images**. PyMuPDF for native text, with **Tesseract OCR** fallback for scanned pages (OCR results are cached).
+- **Table extraction** from PDFs into CSV, so tables can be queried exactly rather than guessed from text.
+- Overlapping chunks (500 characters, 100 overlap) with source and page metadata.
+- Embeddings with `nomic-embed-text` (768 dimensions, via local Ollama) stored in **ChromaDB**, a persistent vector database.
+- **Hybrid search:** semantic vector search and **BM25** keyword search, merged with **Reciprocal Rank Fusion**. Semantic search matches meaning ("income" ↔ "revenue"); BM25 catches exact terms like names, IDs and clause numbers.
+- Grounded prompts: the model answers from retrieved excerpts, cites source and page, and says when the answer isn't in the document.
+- Follow-up questions are rewritten with conversation context ("what about last year?"), and page-specific questions ("summarize page 4") are detected.
+
+**Agentic tool calling**
+- For tabular data the LLM can call `filter_rows` and `aggregate_data` (count, sum, average, min, max, grouped) and use the results in its answer, over up to 3 tool rounds. Numbers come from computation, not from the model's guess.
+
+**Provider-agnostic LLM layer**
+- One client for 7+ providers, with an ordered **model fallback chain**: rate-limited models get a cooldown, removed models are skipped, and auth or network failures stop immediately with a clear error.
+- Token-by-token **streaming** to the browser over NDJSON.
+
+**Production concerns**
+- **WebSocket gateway** for external apps (PHP, Node, mobile) with SHA-256-hashed API keys, a typed JSON protocol, a 30-second heartbeat (closes dead connections with code 4003) and graceful shutdown (close code 1001).
+- **Semantic answer cache:** a repeated or paraphrased question returns the cached answer without an LLM call (cosine similarity ≥ 0.92, scoped per document).
+- **Rate limiting** per client IP, **request-ID tracing** (`X-Request-ID` on every response and log line), and **SHA-256 content hashing** so re-uploading the same file doesn't reprocess it.
+- Uploads are processed in the background with progress polling. Tasks persist in SQLite, and tasks interrupted by a crash are marked failed on restart.
+- `/health` reports uptime, database status, document count, WebSocket connections and OCR availability.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    UI[Web UI] -->|HTTP + NDJSON stream| MW
+    EXT[External apps] -->|WebSocket + API key| WS[WebSocket gateway]
+    WS --> AG
+    subgraph API[FastAPI]
+        MW[Middleware: CORS, request ID, rate limit] --> R[Routes: chat, upload, documents, sessions]
+    end
+    R --> AG[Agent: prompt building, tool calling, streaming]
+    R --> ING[Ingestion: extract, OCR, tables, chunk, embed]
+    ING --> VDB[(ChromaDB vectors)]
+    ING --> BM[BM25 index]
+    AG --> HS[Hybrid search + RRF]
+    HS --> VDB
+    HS --> BM
+    AG --> TOOLS[Data tools: filter_rows, aggregate_data]
+    AG --> LLM[LLM provider layer with fallback]
+    LLM --> P[Ollama / OpenRouter / Gemini / Claude / OpenAI / Groq]
+    AG --> CACHE[(Semantic cache)]
+    R --> DB[(SQLite: sessions, messages, tasks, keys)]
+```
+
+**How a question is answered**
+
+1. The question is checked against the semantic cache. On a hit, the cached answer is returned immediately.
+2. Follow-up questions are enriched with earlier conversation context.
+3. Hybrid search retrieves the best chunks: vector and BM25 results are fused with RRF.
+4. The prompt is built from the excerpts, conversation history and grounding rules.
+5. If the question needs exact numbers from a table, the LLM calls the data tools and receives computed results.
+6. The answer streams back token by token and is saved to the session.
+
+---
 
 ## Quick start
 
+Requirements: Python 3.12, [uv](https://docs.astral.sh/uv/), [Ollama](https://ollama.com) (for embeddings), and optionally [Tesseract](https://github.com/tesseract-ocr/tesseract) for scanned documents.
+
 ```bash
-git clone https://github.com/<you>/ai-document-agent.git
+git clone https://github.com/sandyrai/ai-document-agent.git
 cd ai-document-agent
 cp .env.example .env          # Windows: copy .env.example .env
 uv sync
+
+ollama pull nomic-embed-text  # embeddings, used whichever LLM you choose
 ```
 
-Install [Ollama](https://ollama.com) and pull the embedding model (used for
-document search regardless of which LLM answers questions):
-
-```bash
-ollama pull nomic-embed-text
-```
-
-Then choose an LLM (next section), test it, and start the server:
+Choose an LLM (next section), test it, then start the server:
 
 ```bash
 uv run python -m ai_document_agent.llm_provider   # sends one test prompt
 uv run uvicorn ai_document_agent.main:app --reload
 ```
 
-Open http://127.0.0.1:8000. See [SETUP.md](SETUP.md) for a detailed walkthrough
-(Tesseract OCR, troubleshooting).
+Open http://127.0.0.1:8000. See [SETUP.md](SETUP.md) for a detailed walkthrough, including OCR and troubleshooting.
+
+---
 
 ## Choosing an LLM
 
-All LLM settings live in `.env`. Three variables matter:
+All LLM settings live in `.env`:
 
 | Variable | Meaning |
 |---|---|
 | `LLM_PROVIDER` | `ollama`, `lmstudio`, `openrouter`, `gemini`, `anthropic`, `openai`, `groq`, or `custom` |
 | `LLM_MODELS` | One or more model names, comma-separated, **tried in order** |
-| `LLM_API_KEY` | Your key (cloud only). Or use the provider's own variable, e.g. `GEMINI_API_KEY` |
+| `LLM_API_KEY` | Your key (cloud only), or the provider's own variable such as `GEMINI_API_KEY` |
 
 **Local, free, private (default):**
 ```env
 LLM_PROVIDER=ollama
 LLM_MODELS=qwen3:8b
-```
-Run `ollama pull qwen3:8b` first. Ollama runs on CPU without a GPU, but slowly.
-
-**LM Studio:** start its local server, then
-```env
-LLM_PROVIDER=lmstudio
-LLM_MODELS=<model id shown in LM Studio>
 ```
 
 **Cloud examples:**
@@ -65,50 +119,94 @@ LLM_MODELS=gemini-2.5-flash
 GEMINI_API_KEY=your-key
 ```
 ```env
-LLM_PROVIDER=anthropic
-LLM_MODELS=claude-haiku-4-5
-ANTHROPIC_API_KEY=your-key
-```
-```env
 LLM_PROVIDER=openrouter
 LLM_MODELS=first-choice-model:free,backup-model:free,paid-model
 OPENROUTER_API_KEY=your-key
 ```
 
-**Any other OpenAI-compatible server** (vLLM, llama.cpp, Together, DeepSeek, …):
+**Any OpenAI-compatible server** (vLLM, llama.cpp, Together, DeepSeek, …):
 ```env
 LLM_PROVIDER=custom
 LLM_BASE_URL=http://localhost:8000/v1
 LLM_MODELS=my-model
-LLM_API_KEY=optional
 ```
 
-Model names change often, especially free ones. Check your provider's current
-model list. The app needs a model that supports **tool/function calling** for
-the table-analysis features.
+Model names change often, so check your provider's current list. Table analysis needs a model that supports **tool/function calling**.
 
-### What happens when a model fails
+**When a model fails**, `llm_provider.py` handles it:
+- **429 rate limit:** retries, then puts the model in a 5-minute cooldown so later requests skip it.
+- **404 / model removed / server error:** moves to the next model in `LLM_MODELS`.
+- **401/403 or unreachable server:** stops immediately with a clear message, since other models wouldn't help.
+- **Stream breaks mid-answer:** reports an error instead of switching models, so the answer doesn't appear twice.
 
-`llm_provider.py` handles failures on its own:
+Browser-facing errors never include keys or raw provider responses; full details go to the server log.
 
-- **429 rate limit**: waits and retries the same model, then puts it in a
-  5-minute cooldown so later requests skip it.
-- **404 / model removed / server error**: moves to the next model in `LLM_MODELS`.
-- **401/403 bad key** or **server not reachable**: stops immediately with a
-  clear message, since trying other models wouldn't help.
-- **Stream breaks mid-answer**: reports an error instead of switching models,
-  so the answer doesn't appear twice.
+---
 
-Error messages shown in the browser never include keys or raw provider
-responses. Full details go to the server log. All retry settings can be tuned
-in `.env` (see `.env.example`).
+## API
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/upload` | Upload a document; returns a `task_id` |
+| `GET` | `/upload/status/{task_id}` | Poll processing progress |
+| `POST` | `/chat` | Ask a question; full answer in the response |
+| `POST` | `/chat/stream` | Ask a question; NDJSON stream of `token`, `completed` or `error` events |
+| `GET` | `/documents` | List indexed documents |
+| `DELETE` | `/documents/{document_id}` | Remove a document and its vectors |
+| `GET` / `POST` | `/sessions` | List or create chat sessions |
+| `GET` | `/sessions/{session_id}/messages` | Conversation history |
+| `DELETE` | `/sessions/{session_id}` | Delete a session |
+| `GET` | `/suggestions` | AI-generated starter questions for a document |
+| `GET` | `/health` | System status |
+| `GET` | `/usage` | Remaining daily quota for this client |
+| `WS` | `/ws?api_key=dak_…` | WebSocket gateway for external apps |
+
+Errors return JSON with `error`, `error_type` and `request_id`.
+
+### WebSocket gateway
+
+Create a key with the CLI. The key is shown once; only its SHA-256 hash is stored.
+
+```bash
+uv run python -m ai_document_agent.manage_keys create "my-app"
+uv run python -m ai_document_agent.manage_keys list
+```
+
+Every message is JSON with an `id` (echoed back for correlation), an `action` and a `payload`. Actions: `document.upload`, `document.list`, `document.delete`, `search`, `chat`, `chat.stop`, `suggestions`, `ping`.
+
+| Close code | Meaning |
+|---|---|
+| 1000 | Normal closure |
+| 1001 | Server shutting down |
+| 4001 | Authentication failed |
+| 4002 | Invalid message format |
+| 4003 | Heartbeat timeout |
+
+The key travels as a query parameter because browser WebSocket clients can't set headers on the handshake. Always use `wss://` (TLS) in production.
+
+---
+
+## Design decisions
+
+| Decision | Why |
+|---|---|
+| Hybrid search (BM25 + vectors, RRF) | Embeddings miss exact tokens such as names, invoice numbers and clause IDs; BM25 misses paraphrases. RRF merges the two rankings without tuning score scales. |
+| Tool calling for tables | LLMs are unreliable at arithmetic over many rows. Computing in code and giving the model the result makes numeric answers exact. |
+| Local embeddings via Ollama | No per-request cost, and document text never leaves the machine for indexing. |
+| SHA-256 for API keys | Keys are 256-bit random values, so a fast hash is safe; bcrypt's slowness only helps low-entropy passwords. |
+| SQLite with raw SQL | Zero-config persistence for a single server, and every query is visible. |
+| Model fallback chain | Free and hosted models get rate-limited or removed; the app keeps answering instead of failing. |
+
+**Current limits:** single-server design (SQLite and an in-process BM25 index); the web UI is anonymous and protected by per-IP limits rather than user accounts; CORS is open for local use. Next steps: user authentication, PostgreSQL + pgvector for multi-instance deployment, a cross-encoder re-ranker, and a retrieval evaluation set.
+
+---
 
 ## Security
 
-- Keys belong only in `.env`, which is git-ignored. `.env.example` holds
-  placeholders only.
-- Uploaded files, the vector DB (`chroma_db/`), chat history (`data/`) and the
-  OCR cache are git-ignored as well.
+- Keys live only in `.env`, which is git-ignored; `.env.example` has placeholders.
+- Uploads, the vector DB (`chroma_db/`), chat history (`data/`) and the OCR cache are git-ignored.
+- Uploaded filenames are sanitized against path traversal.
+- `X-Forwarded-For` is trusted only when `TRUST_PROXY_HEADERS=true`, so clients can't bypass rate limits by faking an IP.
 
 ## Tests
 
@@ -116,5 +214,12 @@ in `.env` (see `.env.example`).
 uv run pytest
 ```
 
-`tests/test_llm_provider.py` covers provider configuration and the
-retry/cooldown/fallback logic with fake models. It needs no network.
+The suite needs no LLM or network. It covers the API endpoints and streaming, sessions, rate limiting, the data tools, filename sanitization, chunking, and the provider retry and fallback logic. Tests run against a temporary database, never your real one, and GitHub Actions runs them on every push.
+
+## Project history
+
+DocLens started as a single FastAPI file and was refactored in phases into routers, middleware and a WebSocket gateway. [docs/DEVELOPMENT_LOG.md](docs/DEVELOPMENT_LOG.md) records what was built in each phase and what I learned.
+
+## License
+
+[MIT](LICENSE) © 2026 Sandeep Kumar

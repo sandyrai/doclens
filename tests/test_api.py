@@ -1,410 +1,209 @@
-"""Tests for the FastAPI endpoints.
+"""API tests for the FastAPI app.
 
-Why test the API?
-  The API is the contract between your frontend and
-  backend. If the response shape changes accidentally,
-  the browser UI breaks. Tests catch that before you
-  notice it manually.
-
-How these work:
-  FastAPI has a built-in TestClient that simulates HTTP
-  requests without starting a real server. We also mock
-  Ollama so tests run instantly without needing the model.
+These use FastAPI's TestClient (no real server) and mock
+the agent, so no LLM or Ollama is needed. Conversation
+history is stored in SQLite; conftest.py points it at a
+temporary database.
 
 How to run:
-  cd E:\\ai-document-agent
   uv run pytest tests/ -v
 """
 
 import json
-from unittest.mock import MagicMock, patch
+import uuid
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 
-from ai_document_agent.main import app, sessions
+from ai_document_agent.database import get_session_messages
+from ai_document_agent.main import app
 
 
-# ---------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------
-#
-# What is a fixture?
-#   A reusable piece of test setup. @pytest.fixture
-#   runs before each test that uses it.
-#
-# Why clear sessions?
-#   Tests should be independent — one test's session
-#   data shouldn't leak into another test.
-
-@pytest.fixture(autouse=True)
-def clear_sessions():
-    """Reset session store before each test."""
-    sessions.clear()
-    yield
-    sessions.clear()
-
-
-@pytest.fixture
+@pytest.fixture(scope="module")
 def client():
-    """Create a FastAPI test client."""
-    return TestClient(app)
+    with TestClient(app) as c:
+        yield c
+
+
+def _sid() -> str:
+    return f"test-{uuid.uuid4().hex[:8]}"
 
 
 # ---------------------------------------------------------
-# Helper to mock Ollama responses
-# ---------------------------------------------------------
-
-def make_mock_response(content="Hello!", tool_calls=None):
-    """Create a fake Ollama chat response.
-
-    Why mock Ollama?
-      1. Tests run without Ollama/Qwen installed.
-      2. Tests run in milliseconds, not 30 seconds.
-      3. Tests are deterministic — same input, same output.
-      4. We can simulate errors that are hard to trigger
-         with a real model.
-    """
-
-    message = MagicMock()
-    message.content = content
-    message.tool_calls = tool_calls
-
-    response = MagicMock()
-    response.message = message
-
-    return response
-
-
-# ---------------------------------------------------------
-# Health endpoint
+# Health and frontend
 # ---------------------------------------------------------
 
 class TestHealth:
+    def test_health_reports_status(self, client):
+        res = client.get("/health")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["status"] in {"healthy", "degraded"}
 
-    def test_health_returns_ok(self, client):
-        response = client.get("/health")
-        assert response.status_code == 200
-        assert response.json() == {"status": "healthy"}
-
-
-# ---------------------------------------------------------
-# Root endpoint
-# ---------------------------------------------------------
-
-class TestRoot:
+    def test_every_response_has_request_id(self, client):
+        res = client.get("/health")
+        assert res.headers.get("X-Request-ID", "").startswith("req_")
 
     def test_root_serves_html(self, client):
-        response = client.get("/")
-        assert response.status_code == 200
-        assert "text/html" in response.headers["content-type"]
+        res = client.get("/")
+        assert res.status_code == 200
+        assert "text/html" in res.headers["content-type"]
 
 
 # ---------------------------------------------------------
 # POST /chat
 # ---------------------------------------------------------
 
-class TestChatEndpoint:
+class TestChat:
+    @patch("ai_document_agent.routes.chat.ask_agent")
+    def test_returns_answer(self, mock_agent, client):
+        mock_agent.return_value = "The report has 12 pages."
+        sid = _sid()
+        res = client.post(
+            "/chat",
+            json={"question": "How many pages?", "session_id": sid},
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body["answer"] == "The report has 12 pages."
+        assert body["session_id"] == sid
+        assert body["request_id"].startswith("req_")
 
-    @patch("ai_document_agent.main.ask_agent")
-    def test_chat_returns_answer(
-        self, mock_ask, client
+    @patch("ai_document_agent.routes.chat.ask_agent")
+    def test_saves_both_messages(self, mock_agent, client):
+        mock_agent.return_value = "Answer one"
+        sid = _sid()
+        client.post("/chat", json={"question": "Q1", "session_id": sid})
+        history = get_session_messages(sid)
+        assert [m["role"] for m in history] == ["user", "assistant"]
+        assert history[0]["content"] == "Q1"
+        assert history[1]["content"] == "Answer one"
+
+    @patch("ai_document_agent.routes.chat.ask_agent")
+    def test_conversation_history_is_passed_to_agent(
+        self, mock_agent, client,
     ):
-        mock_ask.return_value = "42"
+        mock_agent.return_value = "ok"
+        sid = _sid()
+        client.post("/chat", json={"question": "First", "session_id": sid})
+        client.post("/chat", json={"question": "Second", "session_id": sid})
+        messages = mock_agent.call_args.args[0]
+        contents = [m["content"] for m in messages]
+        assert "First" in contents and "Second" in contents
 
-        response = client.post(
-            "/chat",
-            json={
-                "question": "What is the answer?",
-                "session_id": "test-session-1",
-            },
-        )
+    @patch("ai_document_agent.routes.chat.ask_agent")
+    def test_sessions_are_isolated(self, mock_agent, client):
+        mock_agent.return_value = "ok"
+        alice, bob = _sid(), _sid()
+        client.post("/chat", json={"question": "Alice Q", "session_id": alice})
+        client.post("/chat", json={"question": "Bob Q", "session_id": bob})
+        assert get_session_messages(alice)[0]["content"] == "Alice Q"
+        assert get_session_messages(bob)[0]["content"] == "Bob Q"
+        assert len(get_session_messages(alice)) == 2
 
-        assert response.status_code == 200
-
-        data = response.json()
-        assert data["answer"] == "42"
-        assert data["session_id"] == "test-session-1"
-        assert "request_id" in data
-
-    @patch("ai_document_agent.main.ask_agent")
-    def test_chat_saves_to_session(
-        self, mock_ask, client
+    @patch("ai_document_agent.routes.chat.ask_agent")
+    def test_agent_failure_returns_500_with_request_id(
+        self, mock_agent, client,
     ):
-        """After a successful chat, both user and
-        assistant messages should be in the session."""
-
-        mock_ask.return_value = "Paris"
-
-        client.post(
-            "/chat",
-            json={
-                "question": "What is the capital?",
-                "session_id": "sess-1",
-            },
+        mock_agent.side_effect = RuntimeError("LLM unreachable")
+        res = client.post(
+            "/chat", json={"question": "Q", "session_id": _sid()},
         )
+        assert res.status_code == 500
+        body = res.json()
+        assert body["error_type"] == "RuntimeError"
+        assert body["request_id"].startswith("req_")
 
-        history = sessions["sess-1"]
-        assert len(history) == 2
-        assert history[0]["role"] == "user"
-        assert history[1]["role"] == "assistant"
-        assert history[1]["content"] == "Paris"
+    def test_question_is_required(self, client):
+        res = client.post("/chat", json={"session_id": _sid()})
+        assert res.status_code == 422
 
-    @patch("ai_document_agent.main.ask_agent")
-    def test_chat_error_returns_500(
-        self, mock_ask, client
-    ):
-        """If the agent crashes, the API should return
-        a structured error, not a raw exception."""
-
-        mock_ask.side_effect = ConnectionError(
-            "Ollama not running"
+    @patch("ai_document_agent.routes.chat.check_and_increment_question")
+    def test_rate_limited_returns_429(self, mock_check, client):
+        mock_check.return_value = {
+            "allowed": False,
+            "used": 15,
+            "limit": 15,
+            "message": "Daily question limit reached.",
+        }
+        res = client.post(
+            "/chat", json={"question": "Q", "session_id": _sid()},
         )
-
-        response = client.post(
-            "/chat",
-            json={
-                "question": "Hello",
-                "session_id": "sess-err",
-            },
-        )
-
-        assert response.status_code == 500
-
-        data = response.json()
-        assert "error" in data
-        assert "Ollama" in data["error"]
-        assert "request_id" in data
-
-    @patch("ai_document_agent.main.ask_agent")
-    def test_chat_error_cleans_session(
-        self, mock_ask, client
-    ):
-        """If the agent crashes, the user message should
-        be removed from session so history stays clean."""
-
-        mock_ask.side_effect = Exception("boom")
-
-        client.post(
-            "/chat",
-            json={
-                "question": "Hello",
-                "session_id": "sess-clean",
-            },
-        )
-
-        # Session should be empty — the dangling
-        # user message was removed
-        history = sessions.get("sess-clean", [])
-        assert len(history) == 0
-
-    def test_chat_requires_question(self, client):
-        """Missing 'question' field should return 422."""
-
-        response = client.post(
-            "/chat",
-            json={"session_id": "test"},
-        )
-
-        assert response.status_code == 422
+        assert res.status_code == 429
+        assert res.json()["usage"]["questions_limit"] == 15
 
 
 # ---------------------------------------------------------
-# POST /chat/stream
+# POST /chat/stream (NDJSON)
 # ---------------------------------------------------------
 
-class TestChatStreamEndpoint:
+def _ndjson(res) -> list[dict]:
+    return [json.loads(line) for line in res.text.splitlines() if line.strip()]
 
-    @patch("ai_document_agent.main.stream_agent")
-    def test_stream_returns_ndjson(
-        self, mock_stream, client
-    ):
-        """Stream endpoint should return NDJSON events."""
 
-        mock_stream.return_value = iter(
-            [
-                {
-                    "type": "status",
-                    "status": "thinking",
-                    "message": "...",
-                    "elapsed_seconds": 0,
-                    "request_id": "req_test",
-                },
-                {
-                    "type": "token",
-                    "content": "Hi there!",
-                },
-                {
-                    "type": "completed",
-                    "response_time_seconds": 1.5,
-                    "assistant_content": "Hi there!",
-                    "request_id": "req_test",
-                },
-            ]
+class TestChatStream:
+    @patch("ai_document_agent.routes.chat.stream_agent")
+    def test_streams_tokens_then_completed(self, mock_stream, client):
+        mock_stream.return_value = iter([
+            {"type": "token", "content": "Hel"},
+            {"type": "token", "content": "lo"},
+            {"type": "completed", "assistant_content": "Hello"},
+        ])
+        sid = _sid()
+        res = client.post(
+            "/chat/stream", json={"question": "Hi", "session_id": sid},
         )
+        assert res.status_code == 200
+        assert "ndjson" in res.headers["content-type"]
+        events = _ndjson(res)
+        assert [e["type"] for e in events][-1] == "completed"
+        assert "".join(
+            e["content"] for e in events if e["type"] == "token"
+        ) == "Hello"
 
-        response = client.post(
-            "/chat/stream",
-            json={
-                "question": "Hello",
-                "session_id": "stream-1",
-            },
+    @patch("ai_document_agent.routes.chat.stream_agent")
+    def test_completed_answer_is_saved(self, mock_stream, client):
+        mock_stream.return_value = iter([
+            {"type": "completed", "assistant_content": "Saved answer"},
+        ])
+        sid = _sid()
+        client.post("/chat/stream", json={"question": "Q", "session_id": sid})
+        history = get_session_messages(sid)
+        assert history[-1]["role"] == "assistant"
+        assert history[-1]["content"] == "Saved answer"
+
+    @patch("ai_document_agent.routes.chat.stream_agent")
+    def test_exception_becomes_error_event(self, mock_stream, client):
+        def boom(*args, **kwargs):
+            yield {"type": "token", "content": "partial"}
+            raise RuntimeError("stream broke")
+
+        mock_stream.side_effect = boom
+        res = client.post(
+            "/chat/stream", json={"question": "Q", "session_id": _sid()},
         )
-
-        assert response.status_code == 200
-        assert "ndjson" in response.headers[
-            "content-type"
-        ]
-
-        # Parse all NDJSON events
-        lines = response.text.strip().split("\n")
-        events = [
-            json.loads(line) for line in lines
-        ]
-
-        # Should have 3 events
-        assert len(events) == 3
-        assert events[0]["type"] == "status"
-        assert events[1]["type"] == "token"
-        assert events[2]["type"] == "completed"
-
-    @patch("ai_document_agent.main.stream_agent")
-    def test_stream_saves_to_session(
-        self, mock_stream, client
-    ):
-        """After a successful stream, the assistant
-        reply should be saved to session history."""
-
-        mock_stream.return_value = iter(
-            [
-                {
-                    "type": "completed",
-                    "response_time_seconds": 1.0,
-                    "assistant_content": "Hello!",
-                    "request_id": "req_test",
-                },
-            ]
-        )
-
-        client.post(
-            "/chat/stream",
-            json={
-                "question": "Hi",
-                "session_id": "stream-save",
-            },
-        )
-
-        history = sessions["stream-save"]
-
-        # User message + assistant reply
-        assert len(history) == 2
-        assert history[0]["role"] == "user"
-        assert history[1]["role"] == "assistant"
-        assert history[1]["content"] == "Hello!"
-
-    @patch("ai_document_agent.main.stream_agent")
-    def test_stream_error_cleans_session(
-        self, mock_stream, client
-    ):
-        """If stream_agent raises, the dangling user
-        message should be cleaned from history."""
-
-        mock_stream.side_effect = Exception(
-            "Ollama crashed"
-        )
-
-        response = client.post(
-            "/chat/stream",
-            json={
-                "question": "Hello",
-                "session_id": "stream-err",
-            },
-        )
-
-        # The error event should be in the response
-        lines = response.text.strip().split("\n")
-        last_event = json.loads(lines[-1])
-        assert last_event["type"] == "error"
-
-        # Session should be clean
-        history = sessions.get("stream-err", [])
-        assert len(history) == 0
+        events = _ndjson(res)
+        assert events[-1]["type"] == "error"
+        assert events[-1]["request_id"].startswith("req_")
 
 
 # ---------------------------------------------------------
-# Session management
+# Client IP handling (rate-limit spoofing protection)
 # ---------------------------------------------------------
 
-class TestSessions:
+class TestClientIp:
+    def test_forwarded_header_only_trusted_when_enabled(self):
+        from starlette.requests import Request
 
-    @patch("ai_document_agent.main.ask_agent")
-    def test_auto_generates_session_id(
-        self, mock_ask, client
-    ):
-        """If no session_id is provided, one should
-        be auto-generated."""
+        from ai_document_agent import shared
 
-        mock_ask.return_value = "ok"
-
-        response = client.post(
-            "/chat",
-            json={"question": "Hello"},
-        )
-
-        data = response.json()
-        assert "session_id" in data
-        assert len(data["session_id"]) > 0
-
-    @patch("ai_document_agent.main.ask_agent")
-    def test_conversation_continuity(
-        self, mock_ask, client
-    ):
-        """Multiple requests with the same session_id
-        should accumulate history."""
-
-        mock_ask.return_value = "answer"
-
-        for i in range(3):
-            client.post(
-                "/chat",
-                json={
-                    "question": f"Q{i}",
-                    "session_id": "persist",
-                },
-            )
-
-        # 3 questions × 2 messages each = 6
-        history = sessions["persist"]
-        assert len(history) == 6
-
-    @patch("ai_document_agent.main.ask_agent")
-    def test_different_sessions_are_isolated(
-        self, mock_ask, client
-    ):
-        """Different session_ids should have separate
-        conversation histories."""
-
-        mock_ask.return_value = "answer"
-
-        client.post(
-            "/chat",
-            json={
-                "question": "Q1",
-                "session_id": "alice",
-            },
-        )
-
-        client.post(
-            "/chat",
-            json={
-                "question": "Q2",
-                "session_id": "bob",
-            },
-        )
-
-        assert len(sessions["alice"]) == 2
-        assert len(sessions["bob"]) == 2
-        assert (
-            sessions["alice"][0]["content"] !=
-            sessions["bob"][0]["content"]
-        )
+        scope = {
+            "type": "http",
+            "headers": [(b"x-forwarded-for", b"1.2.3.4")],
+            "client": ("10.0.0.9", 1234),
+        }
+        with patch.object(shared, "TRUST_PROXY_HEADERS", False):
+            assert shared.get_client_ip(Request(scope)) == "10.0.0.9"
+        with patch.object(shared, "TRUST_PROXY_HEADERS", True):
+            assert shared.get_client_ip(Request(scope)) == "1.2.3.4"
