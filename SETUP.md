@@ -239,34 +239,30 @@ This updates `pyproject.toml` and `uv.lock` automatically.
 
 ```
 ai-document-agent/
-│
-├── src/
-│   └── ai_document_agent/
-│       ├── __init__.py        # Package marker
-│       ├── agent.py           # Agent logic, LLM interaction, tool execution
-│       ├── main.py            # FastAPI app, routes, session management
-│       └── pdf_processor.py   # PDF extraction, chunking, embeddings, ChromaDB
-│
-├── static/
-│   └── index.html             # Browser chat UI (with PDF upload)
-│
-├── tests/
-│   ├── __init__.py            # Test package marker
-│   ├── test_api.py            # API endpoint tests
-│   └── test_calculator.py     # Calculator unit tests
-│
-├── uploads/                   # Uploaded PDF files (auto-created)
-├── chroma_db/                 # ChromaDB vector database (auto-created)
-│
-├── .env                       # Environment variables (empty for now)
-├── .gitignore                 # Git ignore rules
-├── .python-version            # Python version for uv
-├── pyproject.toml             # Project config + dependencies
-├── uv.lock                   # Locked dependency versions
-├── PROGRESS.md                # What's been built and learned
-├── SETUP.md                   # This file
-└── README.md                  # Project readme
+├── src/ai_document_agent/
+│   ├── main.py             # App entry: middleware, routers, startup/shutdown
+│   ├── agent.py            # RAG orchestration, prompts, tool calling, streaming
+│   ├── pdf_processor.py    # Extraction (PDF/DOCX/CSV/OCR), chunking, embeddings, hybrid search
+│   ├── llm_provider.py     # Provider-agnostic LLM client with model fallback
+│   ├── data_analyzer.py    # CSV / table loading for the data tools
+│   ├── content_renderer.py # Tables, charts and rich answer rendering
+│   ├── query_cache.py      # Semantic answer cache
+│   ├── rate_limiter.py     # Per-IP daily usage limits
+│   ├── database.py         # SQLite: sessions, messages, API clients, upload tasks
+│   ├── manage_keys.py      # CLI to create / revoke WebSocket API keys
+│   ├── shared.py           # Shared models, constants and helpers
+│   ├── routes/             # HTTP endpoints (chat, upload, documents, sessions, ...)
+│   ├── middleware/         # CORS, request IDs, API-key auth, rate limiting
+│   └── websocket/          # WebSocket gateway, protocol and handlers
+├── static/                 # Web UI (HTML, CSS, JavaScript)
+├── tests/                  # pytest suite (no LLM needed)
+├── docs/DEVELOPMENT_LOG.md # What was built in each phase, and what I learned
+├── .env.example            # Configuration template (copy to .env)
+├── pyproject.toml / uv.lock
+└── README.md, SETUP.md
 ```
+
+Created at runtime (git-ignored): `uploads/`, `chroma_db/`, `ocr_cache/`, `data/`.
 
 ---
 
