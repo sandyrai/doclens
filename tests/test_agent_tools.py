@@ -266,3 +266,19 @@ class TestAggregateData:
     def test_bad_group_by_column(self, csv_source):
         out = _agent.aggregate_data("salary", "sum", "team", csv_source)
         assert out.startswith("Error")
+
+
+class TestToolSelectionForSmallPdfTables:
+    """Small PDF tables get tools only for arithmetic questions."""
+
+    def _tools(self, question, n_rows=5):
+        rows = [{"Region": f"R{i}", "Revenue": str(i)} for i in range(n_rows)]
+        with patch.object(_agent, "find_extracted_table_csv", return_value="t.csv"), \
+             patch.object(_agent, "load_csv", return_value=(["Region", "Revenue"], rows)):
+            return _agent._get_tools_for_source("report.pdf", question)
+
+    def test_arithmetic_question_gets_tools(self):
+        assert self._tools("What is the average revenue?") == _agent.CSV_TOOLS
+
+    def test_lookup_question_gets_no_tools(self):
+        assert self._tools("Who is the chairman?") == _agent.NO_TOOLS

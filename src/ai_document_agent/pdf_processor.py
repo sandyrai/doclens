@@ -1078,6 +1078,11 @@ def _clean_extracted_table(
     return clean_headers, clean_rows
 
 
+# A grid-line table with at least this many data rows is
+# trusted over looser text-based detections.
+MIN_GRID_TABLE_ROWS = 2
+
+
 def extract_tables_to_csv(
     file_path: str,
     document_id: str,
@@ -1117,49 +1122,66 @@ def extract_tables_to_csv(
         )
         return None
 
+    # Run the strategies, CLEAN each result, then pick:
+    #   - the grid-line table, if it has enough rows, else
+    #   - whichever cleaned result has the most data rows.
+    #
+    # Why clean before comparing? A loose strategy (usually
+    # "text") can treat every line of the page as a "row",
+    # e.g. 47 rows of paragraph fragments, and would beat a
+    # correct 5-row table on raw count, then collapse to 1
+    # row after cleaning. Comparing cleaned results avoids
+    # that. On a tie the earlier, stricter strategy wins
+    # (lines > text > positions).
+    #
+    # Note: header/footer text (titles, names, policies) is
+    # NOT captured here. That info comes through the TEXT
+    # view of the PDF (_extract_text_with_headings), which
+    # the agent always retrieves alongside the table CSV.
+
+    candidates = [
+        ("lines", *_extract_with_find_tables(doc, "lines")),
+        ("text", *_extract_with_find_tables(doc, "text")),
+        ("positions", *_extract_with_text_positions(doc)),
+    ]
+    doc.close()
+
+    best_name: str | None = None
     best_headers: list[str] | None = None
     best_rows: list[list[str]] = []
 
-    # ----- Strategy 1: find_tables (lines) -----
-
-    h1, r1 = _extract_with_find_tables(doc, "lines")
-
-    logger.info(
-        "Strategy 'lines': %d rows extracted",
-        len(r1),
-    )
-
-    if h1 and len(r1) > len(best_rows):
-        best_headers = h1
-        best_rows = r1
-
-    # ----- Strategy 2: find_tables (text) -----
-
-    h2, r2 = _extract_with_find_tables(doc, "text")
-
-    logger.info(
-        "Strategy 'text': %d rows extracted",
-        len(r2),
-    )
-
-    if h2 and len(r2) > len(best_rows):
-        best_headers = h2
-        best_rows = r2
-
-    # ----- Strategy 3: word-position parsing -----
-
-    h3, r3 = _extract_with_text_positions(doc)
-
-    logger.info(
-        "Strategy 'positions': %d rows extracted",
-        len(r3),
-    )
-
-    if h3 and len(r3) > len(best_rows):
-        best_headers = h3
-        best_rows = r3
-
-    doc.close()
+    for name, headers, rows in candidates:
+        if not headers or not rows:
+            logger.info("Strategy '%s': no table", name)
+            continue
+        try:
+            clean_headers, clean_rows = _clean_extracted_table(
+                headers, rows,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Strategy '%s': cleaning failed: %s", name, exc,
+            )
+            continue
+        logger.info(
+            "Strategy '%s': %d raw rows -> %d clean rows",
+            name, len(rows), len(clean_rows),
+        )
+        if not clean_headers:
+            continue
+        # A table with drawn grid lines is strong evidence of
+        # a real table. Loose strategies can turn prose into
+        # many fragmented "rows", so they only win when the
+        # grid-line strategy found little or nothing.
+        if name == "lines" and len(clean_rows) >= MIN_GRID_TABLE_ROWS:
+            best_name, best_headers, best_rows = (
+                name, clean_headers, clean_rows,
+            )
+            break
+        if len(clean_rows) > len(best_rows):
+            best_name = name
+            best_headers = clean_headers
+            best_rows = clean_rows
 
     if not best_headers or not best_rows:
         logger.info(
@@ -1167,26 +1189,7 @@ def extract_tables_to_csv(
         )
         return None
 
-    # Clean up: find real header row, remove empty/title
-    # rows, fix column names. This is critical because
-    # find_tables often grabs page titles, subtitles, and
-    # metadata as table rows — the first row might be the
-    # school name, not the actual column headers.
-    #
-    # Note: header/footer text (school name, teacher name,
-    # grading policy) is NOT captured here. That info comes
-    # through the TEXT view of the PDF (text chunks from
-    # _extract_text_with_headings), which the agent now
-    # always retrieves for PDFs alongside the table CSV.
-    best_headers, best_rows = (
-        _clean_extracted_table(best_headers, best_rows)
-    )
-
-    if not best_rows:
-        logger.info(
-            "No data rows after table cleaning",
-        )
-        return None
+    logger.info("Using table from strategy '%s'", best_name)
 
     # Save as CSV
     csv_filename = f"{document_id}_extracted_table.csv"
