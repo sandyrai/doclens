@@ -1499,6 +1499,21 @@ def _question_needs_tools(question: str) -> bool:
     return any(kw in q for kw in tool_keywords)
 
 
+def _question_needs_arithmetic(question: str) -> bool:
+    """True when answering needs a calculation over rows.
+
+    Narrower than _question_needs_tools(): used for SMALL
+    tables, where lookups are answered fine from context but
+    sums, averages and percentages are not.
+    """
+    q = question.lower()
+    arithmetic_keywords = [
+        "average", "mean", "sum", "total",
+        "percentage", "percent", "combined", "aggregate",
+    ]
+    return any(kw in q for kw in arithmetic_keywords)
+
+
 def _get_tools_for_source(
     source_filter: str | None,
     question: str = "",
@@ -1569,6 +1584,17 @@ def _get_tools_for_source(
                             len(rows),
                         )
                         return []
+                elif _question_needs_arithmetic(question):
+                    # Small table, but the question needs a
+                    # calculation. Even a 5-row table is
+                    # enough for an LLM to get a sum or an
+                    # average wrong, so compute it in code.
+                    logger.info(
+                        "PDF table CSV has %d rows — question "
+                        "needs arithmetic, providing CSV tools",
+                        len(rows),
+                    )
+                    return CSV_TOOLS
                 else:
                     logger.info(
                         "PDF table CSV has only %d rows "

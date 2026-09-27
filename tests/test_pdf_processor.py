@@ -238,3 +238,48 @@ class TestChunkPages:
 
         for chunk in result:
             assert chunk["metadata"]["source"] == "report.pdf"
+
+
+# ---------------------------------------------------------
+# extract_tables_to_csv(): choose the best table
+# ---------------------------------------------------------
+#
+# Regression test: a page of prose plus a small grid table.
+# A loose strategy used to win on raw row count (every text
+# line counted as a row) and the real table was lost.
+
+import csv as _csv  # noqa: E402
+
+import fitz  # noqa: E402
+
+from ai_document_agent.pdf_processor import extract_tables_to_csv  # noqa: E402
+
+
+def _make_pdf_with_table(path):
+    doc = fitz.open()
+    page = doc.new_page()
+    y = 60
+    for i in range(20):
+        page.insert_text((50, y), f"Paragraph line {i} describing the company results in words.")
+        y += 14
+    rows = [["Region", "Revenue", "Projects"], ["North", "412", "1120"],
+            ["West", "356", "980"], ["South", "298", "870"], ["East", "126", "410"]]
+    x0, top, cw, rh = 50, y + 20, 110, 20
+    for r, row in enumerate(rows):
+        for c, cell in enumerate(row):
+            rect = fitz.Rect(x0 + c * cw, top + r * rh, x0 + (c + 1) * cw, top + (r + 1) * rh)
+            page.draw_rect(rect, color=(0, 0, 0), width=0.5)
+            page.insert_text((rect.x0 + 4, rect.y1 - 6), cell)
+    doc.save(str(path))
+    doc.close()
+
+
+def test_extract_tables_prefers_real_table_over_prose(tmp_path):
+    pdf = tmp_path / "report.pdf"
+    _make_pdf_with_table(pdf)
+    out = extract_tables_to_csv(str(pdf), "doc1", tmp_path)
+    assert out is not None
+    with open(out, newline="", encoding="utf-8") as f:
+        rows = list(_csv.reader(f))
+    assert rows[0] == ["Region", "Revenue", "Projects"]
+    assert [r[0] for r in rows[1:]] == ["North", "West", "South", "East"]

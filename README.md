@@ -8,13 +8,28 @@ It runs fully locally (Ollama, LM Studio) or with any cloud LLM: OpenRouter, Goo
 ![python](https://img.shields.io/badge/python-3.12-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
+![DocLens answering questions about an uploaded annual report](docs/screenshots/chat-answer.png)
+
+<table>
+<tr>
+<td width="68%"><img src="docs/screenshots/upload-indexed.png" alt="A PDF uploaded and indexed"></td>
+<td width="32%"><img src="docs/screenshots/mobile.png" alt="Mobile layout"></td>
+</tr>
+<tr>
+<td><sub>Upload: the document is extracted, chunked and indexed in the background.</sub></td>
+<td><sub>Responsive layout on a phone.</sub></td>
+</tr>
+</table>
+
+<sub>Screenshots use a fictional sample report, <a href="samples/Northwind_Solar_Annual_Report_2025.pdf">samples/Northwind_Solar_Annual_Report_2025.pdf</a>, with the local <code>qwen3</code> model via Ollama. Try it with the same file.</sub>
+
 ---
 
 ## Features
 
 **Retrieval-Augmented Generation (RAG)**
 - Ingests **PDF, DOCX, TXT, CSV and images**. PyMuPDF for native text, with **Tesseract OCR** fallback for scanned pages (OCR results are cached).
-- **Table extraction** from PDFs into CSV, so tables can be queried exactly rather than guessed from text.
+- **Table extraction** from PDFs into CSV, so tables can be queried exactly rather than guessed from text. Three detection strategies run on each PDF; tables with drawn grid lines are preferred, and the rest are compared after cleaning.
 - Overlapping chunks (500 characters, 100 overlap) with source and page metadata.
 - Embeddings with `nomic-embed-text` (768 dimensions, via local Ollama) stored in **ChromaDB**, a persistent vector database.
 - **Hybrid search:** semantic vector search and **BM25** keyword search, merged with **Reciprocal Rank Fusion**. Semantic search matches meaning ("income" ↔ "revenue"); BM25 catches exact terms like names, IDs and clause numbers.
@@ -23,6 +38,7 @@ It runs fully locally (Ollama, LM Studio) or with any cloud LLM: OpenRouter, Goo
 
 **Agentic tool calling**
 - For tabular data the LLM can call `filter_rows` and `aggregate_data` (count, sum, average, min, max, grouped) and use the results in its answer, over up to 3 tool rounds. Numbers come from computation, not from the model's guess.
+- Tools are offered only when the question needs them (filtering, counting, or arithmetic such as sums and averages), so simple lookups stay fast. Tool calling needs a capable model: `qwen3:8b` locally, or a cloud model with function calling.
 
 **Provider-agnostic LLM layer**
 - One client for 7+ providers, with an ordered **model fallback chain**: rate-limited models get a cooldown, removed models are skipped, and auth or network failures stop immediately with a clear error.
