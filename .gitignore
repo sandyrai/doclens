@@ -13,9 +13,19 @@ wheels/
 uploads/
 chroma_db/
 
+# OCR text cache (contains text from uploaded documents)
+ocr_cache/
+
+# Chat history database (personal conversation data)
+data/
+
 # Environment variables (contains API keys!)
-# NEVER commit this — it has your OpenRouter key
+# NEVER commit these — they hold your LLM provider keys.
+# Only the placeholder template .env.example is committed.
 .env
+.env.*
+!.env.example
+*.env
 
 # IDE / editor files
 .vscode/
@@ -29,3 +39,7 @@ chroma_db/
 # OS files
 Thumbs.db
 .DS_Store
+
+# Logs (can contain provider error details)
+*.log
+logs/

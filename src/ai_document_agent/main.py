@@ -1,30 +1,159 @@
-import hashlib
-import json
+# ---------------------------------------------------------
+# main.py — Application entry point (Phase 5: Hardening)
+# ---------------------------------------------------------
+#
+# WHAT CHANGED IN PHASE 5:
+#
+#   1. REQUEST ID MIDDLEWARE — every HTTP request now gets a
+#      unique ID automatically (RequestIDMiddleware). No more
+#      calling make_request_id() in each route handler.
+#
+#   2. DATABASE-BACKED UPLOAD TASKS — upload tasks are now
+#      persisted to SQLite so they survive server restarts.
+#      init_upload_tasks() creates the table at startup.
+#
+#   3. GRACEFUL SHUTDOWN — the server notifies all connected
+#      WebSocket wrappers before shutting down (close code
+#      1001 = "going away"). This is done via FastAPI's
+#      lifespan/shutdown event system.
+#
+#   4. OLD TASK CLEANUP — stale upload tasks older than 24
+#      hours are pruned at startup.
+#
+#   5. VERSION BUMP — 0.4.0 → 0.5.0
+#
+# WHAT CHANGED IN PHASE 4:
+#
+#   Added the WebSocket gateway — wrapper applications can
+#   now connect via ws://host/ws?api_key=dak_xxx for real-
+#   time bidirectional communication with DocLens.
+#
+# WHAT CHANGED IN PHASE 2:
+#
+#   BEFORE (Phase 1): main.py was a ~1900-line monolith
+#   containing ALL 16+ route handlers, background processing,
+#   request models, helper functions, and constants.
+#
+#   AFTER (Phase 2): main.py is a slim ~150-line file that
+#   only does setup and wiring:
+#
+#     1. Load .env (MUST be first — see explanation below)
+#     2. Configure logging
+#     3. Create FastAPI app
+#     4. Set up CORS + Request ID middleware
+#     5. Mount static files
+#     6. Initialize databases (SQLite, cache, usage, tasks)
+#     7. Wire up route modules (include_router)
+#     8. Register shutdown handler (Phase 5)
+#
+#   All route logic moved to:
+#     routes/health.py      → GET /, /health, /usage
+#     routes/chat.py        → POST /chat, /chat/stream
+#     routes/upload.py      → POST /upload, /upload/status
+#     routes/documents.py   → GET/DELETE /documents, images
+#     routes/sessions.py    → CRUD /sessions
+#     routes/suggestions.py → GET /suggestions
+#
+#   Shared state and helpers moved to:
+#     shared.py → upload_tasks, document_suggestions,
+#                 ChatRequest, etc.
+#
+#   Middleware organized in:
+#     middleware/cors.py       → CORS configuration
+#     middleware/request_id.py → Request ID (Phase 5)
+#     middleware/auth.py       → API key auth (Phase 3)
+#
+# WHY THIS STRUCTURE?
+#
+#   1. READABILITY — you can understand any feature by reading
+#      ONE file instead of scrolling through 1900 lines.
+#
+#   2. TEAMWORK — two developers can edit chat.py and
+#      upload.py at the same time without merge conflicts.
+#
+#   3. TESTING — you can test routes/chat.py independently
+#      by importing its router into a test FastAPI app.
+#
+#   4. NAVIGATION — "where's the upload logic?" → upload.py.
+#      No more Ctrl+F through a giant file.
+#
+#   5. MAINTENANCE — adding a new endpoint? Create a new
+#      route file, add a router, include it here. Done.
+# ---------------------------------------------------------
+
+
+# ---------------------------------------------------------
+# Load .env FIRST — before ANY other imports
+# ---------------------------------------------------------
+#
+# WHY THIS MUST BE AT THE VERY TOP:
+#
+#   When Python imports a module, it runs ALL the code at
+#   the module level immediately. Our llm_provider.py reads
+#   LLM_PROVIDER, LLM_MODELS and API keys from environment
+#   variables at import time.
+#
+#   If we import agent.py (which imports llm_provider.py)
+#   BEFORE calling load_dotenv(), the .env file hasn't been
+#   loaded yet, so os.getenv("LLM_PROVIDER") returns None
+#   and defaults to "ollama" — even if .env says "gemini".
+#
+#   Order matters:
+#     1. load_dotenv()         <- reads .env into os.environ
+#     2. import routes/...     <- routes import agent/llm_provider
+#     3. llm_provider reads   <- NOW sees your LLM_PROVIDER
+
+from dotenv import load_dotenv
+load_dotenv()  # Must happen before importing routes (which import agent)
+
 import logging
-import re
-import shutil
-import uuid
-from pathlib import Path
 
-from fastapi import FastAPI, UploadFile
-from fastapi.responses import (
-    FileResponse,
-    JSONResponse,
-    StreamingResponse,
-)
+from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 
-from ai_document_agent.agent import (
-    ask_agent,
-    stream_agent,
+# ---------------------------------------------------------
+# Import initialization functions
+# ---------------------------------------------------------
+#
+# These create database tables at startup. We call them
+# here (not in the route files) because:
+#   1. They should run ONCE at server start
+#   2. They must run BEFORE any request arrives
+#   3. main.py is the single entry point — the right place
+#      for one-time setup
+
+from ai_document_agent.database import (
+    init_db,
+    init_api_clients,
+    init_upload_tasks,
+    cleanup_old_upload_tasks,
 )
-from ai_document_agent.pdf_processor import (
-    SUPPORTED_EXTENSIONS,
-    delete_document,
-    list_documents,
-    process_document,
+from ai_document_agent.query_cache import init_query_cache
+from ai_document_agent.rate_limiter import (
+    cleanup_old_usage,
+    init_usage_limits,
 )
+
+# Import shared constants (BASE_DIR for static files)
+from ai_document_agent.shared import BASE_DIR
+
+# Import CORS setup from middleware
+from ai_document_agent.middleware.cors import setup_cors
+
+# Import Request ID middleware (Phase 5)
+from ai_document_agent.middleware.request_id import (
+    RequestIDMiddleware,
+)
+
+# Import all route modules at once via the routes package.
+# See routes/__init__.py for how all_routers is assembled.
+from ai_document_agent.routes import all_routers
+
+# Import WebSocket gateway (Phase 4)
+# The ws_router provides the /ws endpoint for wrapper apps.
+# Also import the manager for graceful shutdown (Phase 5).
+from ai_document_agent.websocket import ws_router
+from ai_document_agent.websocket.gateway import manager
 
 
 # ---------------------------------------------------------
@@ -34,17 +163,10 @@ from ai_document_agent.pdf_processor import (
 # Why use logging instead of print()?
 #
 # 1. TIMESTAMPS — every log line shows when it happened.
-# 2. LOG LEVELS — INFO for normal flow, ERROR for
-#    failures, WARNING for suspicious but not broken.
+# 2. LOG LEVELS — INFO for normal flow, ERROR for failures.
 # 3. SOURCE — shows which module the log came from.
-# 4. FILTERING — you can turn off noisy modules without
-#    changing code.
-# 5. PRODUCTION-READY — in production you'd send logs
-#    to a file, Datadog, CloudWatch, etc. print() can't
-#    do that.
-#
-# Format example:
-#   2026-08-18 14:23:05 INFO  main  [req_abc123] ...
+# 4. FILTERING — turn off noisy modules without code changes.
+# 5. PRODUCTION-READY — logs can go to files, Datadog, etc.
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,625 +181,209 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------
-# App setup
+# Create the FastAPI application
 # ---------------------------------------------------------
 
 app = FastAPI(
-    title="AI Document Agent",
-    description="Local AI agent using Ollama",
-    version="0.1.0",
+    title="DocLens",
+    description=(
+        "AI-powered document analysis engine with real-time "
+        "WebSocket API for wrapper applications"
+    ),
+    version="0.5.0",  # Bumped for Phase 5: Production Hardening
 )
 
 
-BASE_DIR = Path(__file__).resolve().parents[2]
-
 # ---------------------------------------------------------
-# Upload directory
+# Middleware setup
 # ---------------------------------------------------------
 #
-# Where uploaded PDFs are temporarily stored before
-# processing. After extraction and embedding, the PDF
-# stays on disk so you could re-process it later.
+# Middleware runs on EVERY request. We configure it here,
+# right after creating the app, before mounting routes.
+#
+# Order matters for middleware — they execute in REVERSE
+# order of how they're added:
+#
+#   Added first  → runs LAST  (outermost wrapper)
+#   Added last   → runs FIRST (innermost wrapper)
+#
+# So the order below means:
+#   1. CORS is added first → runs last → always adds
+#      CORS headers, even on error responses.
+#   2. RequestIDMiddleware is added second → runs first →
+#      every request gets an ID before any route sees it.
+#
+# Visually:
+#   Client → [CORS outer] → [RequestID inner] → Route → back out
 
-UPLOAD_DIR = BASE_DIR / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
+setup_cors(app)
+
+# ---------------------------------------------------------
+# Request ID middleware (Phase 5)
+# ---------------------------------------------------------
+#
+# Generates a unique "req_xxxxxxxx" ID for every HTTP
+# request and stores it in request.state.request_id.
+# Also adds an X-Request-ID header to every response.
+#
+# Before Phase 5, each route called make_request_id()
+# manually — easy to forget on new endpoints. Now it's
+# automatic and consistent.
+
+app.add_middleware(RequestIDMiddleware)
+
+
+# ---------------------------------------------------------
+# Static files
+# ---------------------------------------------------------
+#
+# Mount the /static directory so the browser can load
+# app.js, styles.css, and other frontend assets.
 
 app.mount(
     "/static",
-    StaticFiles(
-        directory=BASE_DIR / "static"
-    ),
+    StaticFiles(directory=BASE_DIR / "static"),
     name="static",
 )
 
 
 # ---------------------------------------------------------
-# Session store
-# ---------------------------------------------------------
-
-sessions: dict[str, list[dict]] = {}
-
-MAX_MESSAGES_PER_SESSION = 50
-
-
-def get_session_messages(
-    session_id: str,
-) -> list[dict]:
-    """Get or create a session's message history."""
-
-    if session_id not in sessions:
-        sessions[session_id] = []
-
-    return sessions[session_id]
-
-
-def trim_session(messages: list[dict]) -> None:
-    """Keep only the most recent messages."""
-
-    while len(messages) > MAX_MESSAGES_PER_SESSION:
-        messages.pop(0)
-
-
-# ---------------------------------------------------------
-# Request ID generation
+# Database initialization
 # ---------------------------------------------------------
 #
-# Every API call gets a unique request_id like "req_a1b2".
-# This ID appears in:
-#   - every log line for this request
-#   - every streaming event sent to the browser
-#   - error responses
+# All three init functions create their respective tables
+# IF they don't already exist. Safe to call multiple times.
 #
-# Why?
-#   When something goes wrong, you search your terminal
-#   for the request_id and see the complete trace —
-#   which session, what the user asked, which tool was
-#   called, where it failed. Without this, debugging
-#   concurrent requests is nearly impossible.
-
-def make_request_id() -> str:
-    """Generate a short, unique request ID."""
-
-    return "req_" + uuid.uuid4().hex[:8]
-
+# Order:
+#   1. init_db()          → sessions + messages tables
+#   2. init_query_cache() → query_cache table (same DB)
+#   3. init_usage_limits()→ usage_limits table (same DB)
+#   4. cleanup_old_usage()→ delete records older than 30 days
 
 # ---------------------------------------------------------
-# Request / response models
-# ---------------------------------------------------------
+# Order matters — tables must exist before anything else
+# tries to query them:
+#   1. init_db()                 → sessions + messages tables
+#   2. init_api_clients()        → api_clients table (Phase 3)
+#   3. init_query_cache()        → query_cache table
+#   4. init_usage_limits()       → usage_limits table
+#   5. init_upload_tasks()       → upload_tasks table (Phase 5)
+#   6. cleanup_old_usage()       → prune stale usage records
+#   7. cleanup_old_upload_tasks()→ prune stale upload tasks
 
-class ChatRequest(BaseModel):
-    question: str
-    session_id: str = Field(
-        default_factory=lambda: str(uuid.uuid4()),
-        description=(
-            "Browser session ID. If not provided, "
-            "a new session is created."
-        ),
-    )
-    source_filter: str | None = Field(
-        default=None,
-        description=(
-            "Optional filename to scope retrieval "
-            "to a single document. If None, searches "
-            "all uploaded documents."
-        ),
-    )
-
+init_db()
+init_api_clients()
+init_query_cache()
+init_usage_limits()
+init_upload_tasks()
+cleanup_old_usage(days_to_keep=30)
 
 # ---------------------------------------------------------
-# Routes
+# Clean up old upload tasks (Phase 5)
 # ---------------------------------------------------------
+#
+# Upload tasks older than 24 hours are deleted. These are
+# tasks from previous sessions that no browser is polling
+# anymore. Keeps the database tidy.
 
-@app.get("/")
-def root():
-    return FileResponse(
-        BASE_DIR / "static" / "index.html"
-    )
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "healthy"
-    }
-
-
-@app.post("/chat")
-def chat_endpoint(request: ChatRequest):
-
-    request_id = make_request_id()
-
+cleaned = cleanup_old_upload_tasks(hours=24)
+if cleaned > 0:
     logger.info(
-        "[%s] POST /chat | session=%s | q=%s",
-        request_id,
-        request.session_id[:8] + "...",
-        request.question[:80],
-    )
-
-    try:
-
-        # 1. Get session history
-        messages = get_session_messages(
-            request.session_id
-        )
-
-        # 2. Add the new user message
-        messages.append(
-            {
-                "role": "user",
-                "content": request.question,
-            }
-        )
-
-        # 3. Run the agent with full history
-        answer = ask_agent(
-            messages,
-            request_id=request_id,
-            source_filter=request.source_filter,
-        )
-
-        # 4. Add the assistant's reply to history
-        messages.append(
-            {
-                "role": "assistant",
-                "content": answer,
-            }
-        )
-
-        # 5. Trim if too long
-        trim_session(messages)
-
-        return {
-            "question": request.question,
-            "answer": answer,
-            "session_id": request.session_id,
-            "request_id": request_id,
-        }
-
-    except Exception as exc:
-
-        logger.error(
-            "[%s] /chat failed: %s",
-            request_id,
-            exc,
-            exc_info=True,
-        )
-
-        # Remove the user message we just added,
-        # since the request failed. We don't want
-        # a broken exchange in the history.
-
-        if (
-            messages
-            and messages[-1].get("role") == "user"
-        ):
-            messages.pop()
-
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": str(exc),
-                "error_type": type(exc).__name__,
-                "request_id": request_id,
-            },
-        )
-
-
-@app.post("/chat/stream")
-def chat_stream(request: ChatRequest):
-
-    request_id = make_request_id()
-
-    logger.info(
-        "[%s] POST /chat/stream | session=%s | q=%s",
-        request_id,
-        request.session_id[:8] + "...",
-        request.question[:80],
-    )
-
-    # Get session history and add user message
-    messages = get_session_messages(
-        request.session_id
-    )
-
-    messages.append(
-        {
-            "role": "user",
-            "content": request.question,
-        }
-    )
-
-    def generate():
-
-        had_error = False
-
-        try:
-
-            for event in stream_agent(
-                messages,
-                request_id=request_id,
-                source_filter=request.source_filter,
-            ):
-
-                yield json.dumps(event) + "\n"
-
-                # Track if agent reported an error
-                if event.get("type") == "error":
-                    had_error = True
-
-                # When the stream completes, save
-                # the assistant answer to history.
-                if event.get("type") == "completed":
-
-                    assistant_content = event.get(
-                        "assistant_content", ""
-                    )
-
-                    if assistant_content:
-
-                        messages.append(
-                            {
-                                "role": "assistant",
-                                "content": (
-                                    assistant_content
-                                ),
-                            }
-                        )
-
-                        trim_session(messages)
-
-        except Exception as exc:
-
-            # This catches unexpected errors that
-            # weren't handled inside stream_agent.
-            # For example, a network drop mid-stream
-            # or an Ollama crash.
-
-            logger.error(
-                "[%s] Stream failed: %s",
-                request_id,
-                exc,
-                exc_info=True,
-            )
-
-            had_error = True
-
-            yield json.dumps(
-                {
-                    "type": "error",
-                    "message": (
-                        f"Unexpected error: {exc}"
-                    ),
-                    "error_type": (
-                        type(exc).__name__
-                    ),
-                    "request_id": request_id,
-                }
-            ) + "\n"
-
-        finally:
-
-            # If there was an error and no assistant
-            # reply was saved, remove the dangling
-            # user message so the history stays clean.
-
-            if had_error:
-
-                if (
-                    messages
-                    and messages[-1].get("role")
-                    == "user"
-                ):
-                    messages.pop()
-
-                    logger.info(
-                        "[%s] Removed dangling user "
-                        "message after error",
-                        request_id,
-                    )
-
-    return StreamingResponse(
-        generate(),
-        media_type="application/x-ndjson",
+        "Cleaned up %d stale upload task(s) at startup",
+        cleaned,
     )
 
 
 # ---------------------------------------------------------
-# PDF upload endpoint
+# Wire up all route modules
 # ---------------------------------------------------------
 #
-# How file uploads work in FastAPI:
+# This is the key step of Phase 2: instead of defining
+# routes directly on `app`, we import routers from the
+# routes package and include them. Each router brings its
+# own endpoints, and they all get mounted on the main app.
 #
-# 1. The browser sends a multipart/form-data request
-#    (not JSON). This is the standard way to send files
-#    over HTTP.
+# app.include_router(router) takes all the @router.get(),
+# @router.post(), etc. decorators from that router and
+# registers them on the real app. It's like copy-pasting
+# the route definitions here, but without the clutter.
 #
-# 2. FastAPI's UploadFile gives us a file-like object
-#    with .filename, .read(), .file, etc.
-#
-# 3. We save the file to disk first, then process it.
-#    Why not process from memory? Because PyMuPDF (fitz)
-#    works best with file paths, and saving first means
-#    we have a backup copy.
-#
-# 4. Processing = extract text → chunk → embed → store
-#    in ChromaDB. This can take 10-60 seconds depending
-#    on PDF size and CPU speed.
+# You could also add prefixes here if needed:
+#   app.include_router(chat_router, prefix="/api/v1")
+# But for now we keep the same URL structure as before.
+
+for router in all_routers:
+    app.include_router(router)
 
 # ---------------------------------------------------------
-# Upload security constants
+# WebSocket gateway (Phase 4)
 # ---------------------------------------------------------
+#
+# The WebSocket route lives alongside the HTTP routes on
+# the same server and port. When a wrapper app connects to
+# ws://host/ws?api_key=dak_xxx, it goes through the ws_router
+# which handles authentication, message routing, and the
+# connection lifecycle.
+#
+# This is separate from the HTTP routers above because:
+#   1. WebSocket has a fundamentally different lifecycle
+#      (persistent connection vs request/response)
+#   2. It uses API key auth, not IP-based rate limiting
+#   3. It's used by wrapper apps, not the web UI
 
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
+app.include_router(ws_router)
 
 
-def _sanitize_filename(raw_name: str) -> str:
-    """Sanitize an uploaded filename to prevent
-    path traversal attacks.
+# ---------------------------------------------------------
+# Shutdown event handler (Phase 5)
+# ---------------------------------------------------------
+#
+# WHAT IS A SHUTDOWN EVENT?
+#
+#   FastAPI (via Starlette) lets you register functions
+#   that run when the server is shutting down — triggered
+#   by SIGTERM (Docker stop), SIGINT (Ctrl+C), or uvicorn's
+#   graceful shutdown.
+#
+#   This is the place to clean up resources:
+#     - Close database connections
+#     - Flush caches
+#     - Notify connected clients
+#
+# WHY @app.on_event("shutdown")?
+#
+#   This decorator registers an async function that FastAPI
+#   calls during the shutdown sequence. It runs AFTER the
+#   server stops accepting new connections but BEFORE
+#   existing connections are forcibly terminated.
+#
+#   This gives us a window to send close frames to WebSocket
+#   clients so they know the shutdown is intentional.
+#
+# NOTE: @app.on_event() is the older API. FastAPI 0.93+
+#   introduced "lifespan" as the newer pattern. We use
+#   on_event() here because it's simpler to understand
+#   and works fine for our single-event use case.
 
-    Strips directory components, replaces dangerous
-    characters, and ensures a safe basename remains.
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Gracefully close all WebSocket connections on shutdown.
+
+    This runs when the server receives SIGTERM or SIGINT.
+    It notifies all connected wrapper apps that the server
+    is shutting down (close code 1001 = "Going Away"),
+    giving them a chance to reconnect gracefully.
     """
 
-    # Take only the final path component — kills
-    # "../../etc/passwd" and "C:\\Windows\\system32\\x"
-    name = Path(raw_name).name
+    logger.info("DocLens shutting down...")
 
-    # Remove any remaining path separators
-    name = name.replace("/", "_").replace("\\", "_")
+    await manager.shutdown_all()
 
-    # Remove null bytes and other control characters
-    name = re.sub(r'[\x00-\x1f]', '', name)
-
-    # Collapse whitespace
-    name = name.strip()
-
-    if not name:
-        name = "unnamed_upload"
-
-    return name
+    logger.info("DocLens shutdown complete.")
 
 
-@app.post("/upload")
-def upload_pdf(file: UploadFile):
-
-    request_id = make_request_id()
-
-    # Sanitize the filename to prevent path traversal
-    safe_filename = _sanitize_filename(
-        file.filename or "unnamed",
-    )
-
-    logger.info(
-        "[%s] POST /upload | file=%s | size=%s",
-        request_id,
-        safe_filename,
-        file.size,
-    )
-
-    # Validate file type
-    file_ext = Path(safe_filename).suffix.lower()
-
-    if file_ext not in SUPPORTED_EXTENSIONS:
-        supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": (
-                    f"Unsupported file type: "
-                    f"{safe_filename}. "
-                    f"Supported: {supported}"
-                ),
-                "request_id": request_id,
-            },
-        )
-
-    try:
-
-        # -------------------------------------------------
-        # File size check (Phase 8.1)
-        # -------------------------------------------------
-        #
-        # Prevent huge uploads from consuming all memory
-        # and disk. We read the file bytes below anyway,
-        # so checking length is free.
-
-        file_bytes = file.file.read()
-
-        if len(file_bytes) > MAX_UPLOAD_BYTES:
-            max_mb = MAX_UPLOAD_BYTES // (1024 * 1024)
-            actual_mb = len(file_bytes) / (1024 * 1024)
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": (
-                        f"File too large: "
-                        f"{actual_mb:.1f} MB. "
-                        f"Maximum: {max_mb} MB."
-                    ),
-                    "request_id": request_id,
-                },
-            )
-
-        # -------------------------------------------------
-        # SHA-256 content-based document ID
-        # -------------------------------------------------
-        #
-        # Why SHA-256 instead of random UUID?
-        #
-        #   With UUID: uploading report.pdf twice creates
-        #   two separate document IDs → duplicate chunks in
-        #   ChromaDB → wasted storage + search returns the
-        #   same text twice from two "different" documents.
-        #
-        #   With SHA-256: the hash of file bytes is always
-        #   the same for the same file content. Re-uploading
-        #   the same PDF produces the same document_id, and
-        #   ChromaDB's upsert overwrites the old chunks
-        #   instead of duplicating them.
-        #
-        # We use the first 12 hex chars (48 bits) of the
-        # SHA-256 hash. Collision probability is negligible
-        # for a personal document tool (you'd need ~16
-        # million PDFs for a 50% chance of one collision).
-
-        document_id = hashlib.sha256(
-            file_bytes
-        ).hexdigest()[:12]
-
-        # Check if this exact file was already uploaded
-        existing_docs = list_documents()
-        for doc in existing_docs:
-            if doc["document_id"] == document_id:
-                logger.info(
-                    "[%s] Duplicate detected: '%s' "
-                    "matches existing '%s' (id=%s)",
-                    request_id,
-                    safe_filename,
-                    doc["filename"],
-                    document_id,
-                )
-
-                return {
-                    "document_id": document_id,
-                    "filename": doc["filename"],
-                    "pages": doc["pages"],
-                    "chunks": doc["chunks"],
-                    "status": "duplicate",
-                    "request_id": request_id,
-                    "summary": (
-                        f"This file was already uploaded "
-                        f"as '{doc['filename']}'. "
-                        f"No duplicate created."
-                    ),
-                    "insights": [],
-                }
-
-        # Save file to disk (using sanitized filename)
-        save_path = UPLOAD_DIR / f"{document_id}_{safe_filename}"
-
-        with open(save_path, "wb") as f:
-            f.write(file_bytes)
-
-        logger.info(
-            "[%s] Saved to: %s (hash=%s)",
-            request_id,
-            save_path,
-            document_id,
-        )
-
-        # Process: extract → chunk → embed → store
-        result = process_document(
-            file_path=str(save_path),
-            filename=safe_filename,
-            document_id=document_id,
-        )
-
-        result["request_id"] = request_id
-
-        logger.info(
-            "[%s] Upload complete: %d pages, %d chunks",
-            request_id,
-            result.get("pages", 0),
-            result.get("chunks", 0),
-        )
-
-        # -------------------------------------------------
-        # No auto-summary — return immediately
-        # -------------------------------------------------
-        #
-        # Previously we called generate_summary() here,
-        # which added 30-60s of LLM processing on CPU
-        # and also re-extracted the PDF (double work).
-        #
-        # Now we return right after indexing. The user
-        # can ask for a summary in chat — the forced
-        # retrieval will find the right chunks and the
-        # LLM will summarize them.
-        #
-        # This cuts upload time from 60-90s to 5-15s.
-
-        result["summary"] = (
-            f"Document indexed successfully: "
-            f"{result.get('pages', 0)} pages, "
-            f"{result.get('chunks', 0)} chunks. "
-            f"Ask me anything about this document!"
-        )
-        result["insights"] = []
-
-        return result
-
-    except Exception as exc:
-
-        logger.error(
-            "[%s] Upload failed: %s",
-            request_id,
-            exc,
-            exc_info=True,
-        )
-
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": str(exc),
-                "error_type": type(exc).__name__,
-                "request_id": request_id,
-            },
-        )
-
-
-
-# ---------------------------------------------------------
-# Document management endpoints
-# ---------------------------------------------------------
-
-@app.get("/documents")
-def get_documents():
-    """List all uploaded documents."""
-
-    try:
-        docs = list_documents()
-        return {"documents": docs}
-
-    except Exception as exc:
-
-        logger.error(
-            "Failed to list documents: %s",
-            exc,
-            exc_info=True,
-        )
-
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(exc)},
-        )
-
-
-@app.delete("/documents/{document_id}")
-def remove_document(document_id: str):
-    """Delete a document and its chunks."""
-
-    request_id = make_request_id()
-
-    logger.info(
-        "[%s] DELETE /documents/%s",
-        request_id,
-        document_id,
-    )
-
-    success = delete_document(document_id)
-
-    if success:
-        return {
-            "status": "deleted",
-            "document_id": document_id,
-            "request_id": request_id,
-        }
-
-    return JSONResponse(
-        status_code=404,
-        content={
-            "error": f"Document '{document_id}' not found.",
-            "request_id": request_id,
-        },
-    )
+logger.info(
+    "DocLens started (Phase 5: Production Hardening) "
+    "— %d HTTP route modules + WebSocket gateway loaded",
+    len(all_routers),
+)

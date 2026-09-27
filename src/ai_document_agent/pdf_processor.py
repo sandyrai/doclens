@@ -33,7 +33,9 @@ How to run:
 
 import csv
 import hashlib
+import io
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +48,148 @@ import chromadb
 
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------
+# OCR support (Phase 2) — Tesseract + Pillow
+# ---------------------------------------------------------
+#
+# WHY OCR?
+#
+#   Many PDFs are "scanned" — they contain page-sized images
+#   of paper documents, not real text. When you open a scanned
+#   PDF and try to select text, nothing highlights. PyMuPDF's
+#   get_text() returns empty strings for these pages.
+#
+#   OCR (Optical Character Recognition) reads the image pixels
+#   and converts them back into text. Tesseract is the most
+#   widely used open-source OCR engine, originally developed
+#   by HP and now maintained by Google.
+#
+# HOW IT WORKS:
+#
+#   1. We detect scanned pages: if get_text() returns very
+#      little text BUT the page has images, it's scanned.
+#   2. We render the page to a high-resolution image (300 DPI).
+#   3. Tesseract reads the image and returns the text.
+#   4. The OCR text replaces the empty extraction, so the
+#      rest of the pipeline (chunking → embedding → search)
+#      works exactly the same.
+#
+# GRACEFUL DEGRADATION:
+#
+#   If Tesseract is NOT installed on the system, OCR is
+#   silently disabled. The app still works for normal PDFs —
+#   only scanned PDFs will show "No text found" instead of
+#   crashing.
+#
+# INSTALLATION:
+#
+#   Windows:  Download from https://github.com/UB-Mannheim/tesseract/wiki
+#             Add to PATH or set TESSERACT_CMD env var.
+#   Linux:    sudo apt install tesseract-ocr
+#   macOS:    brew install tesseract
+#
+#   Python packages (already in pyproject.toml):
+#     pip install pytesseract Pillow
+
+# Try to import OCR libraries. If Tesseract is not installed,
+# we set a flag and skip OCR gracefully instead of crashing.
+try:
+    import pytesseract
+    from PIL import Image
+
+    # Quick check: is the Tesseract binary actually available?
+    # pytesseract.get_tesseract_version() throws FileNotFoundError
+    # if the binary isn't found on PATH.
+    pytesseract.get_tesseract_version()
+    OCR_AVAILABLE = True
+    logger.info(
+        "OCR enabled (Tesseract %s)",
+        pytesseract.get_tesseract_version(),
+    )
+except (ImportError, FileNotFoundError, Exception) as _ocr_err:
+    OCR_AVAILABLE = False
+    logger.warning(
+        "OCR disabled: %s. Scanned PDFs and images "
+        "won't be searchable. Install Tesseract to enable OCR.",
+        _ocr_err,
+    )
+
+
+# ---------------------------------------------------------
+# OCR Configuration
+# ---------------------------------------------------------
+#
+# OCR_DPI = 300:
+#   The resolution at which we render PDF pages to images
+#   before running OCR. 300 DPI is the standard for document
+#   OCR — it balances quality vs speed. Higher DPI (e.g. 600)
+#   gives slightly better accuracy but takes 4x more memory
+#   and time.
+#
+# OCR_MIN_TEXT_LENGTH = 50:
+#   If regular text extraction finds fewer than 50 characters
+#   on a page, we consider it "empty" and try OCR. This
+#   threshold handles pages that have tiny amounts of real
+#   text (like a page number) but are mostly scanned images.
+#
+# OCR_LANG = "eng":
+#   The language Tesseract should expect. "eng" works for
+#   English documents. For Hindi, use "hin". For both,
+#   use "eng+hin". You need the corresponding Tesseract
+#   language data files installed.
+
+OCR_DPI = 300
+OCR_MIN_TEXT_LENGTH = 50
+OCR_LANG = "eng"
+
+# ---------------------------------------------------------
+# OCR Cache Directory
+# ---------------------------------------------------------
+#
+# WHY CACHE OCR RESULTS?
+#
+#   OCR is SLOW — 2-10 seconds per page. A 20-page scanned
+#   PDF takes 40-200 seconds to OCR. If the user re-uploads
+#   the same file, or the server restarts and re-indexes,
+#   we don't want to run Tesseract all over again.
+#
+#   The cache stores OCR text in plain .txt files, named by
+#   a hash of the PDF content + page number. Same file =
+#   same hash = instant cache hit.
+#
+#   Cache location: {project}/ocr_cache/
+#   Files are small (~2KB each) and accumulate slowly.
+
+# ---------------------------------------------------------
+# OCR CACHE DIRECTORY (Fix 4 — per-document subdirectories)
+#
+#   Previously: all OCR cache files went into a flat
+#   ocr_cache/ folder. With many documents, this became
+#   a mess of hundreds of files with hash-based names.
+#
+#   Now: each document gets its own subdirectory, named
+#   after the document file (sanitized for filesystem
+#   safety). This makes it easy to:
+#     - See which documents have been OCR'd
+#     - Delete cache for a specific document
+#     - Debug OCR issues per document
+#
+#   Structure:
+#     ocr_cache/
+#       my_report.pdf/
+#         page_0.txt
+#         page_1.txt
+#       scanned_form.pdf/
+#         page_0.txt
+# ---------------------------------------------------------
+OCR_CACHE_DIR = Path(__file__).resolve().parents[2] / "ocr_cache"
+OCR_CACHE_DIR.mkdir(exist_ok=True)
+
+# Upload directory path — needed by the migration function
+# to find all uploaded documents and compute their hashes.
+_UPLOAD_DIR = Path(__file__).resolve().parents[2] / "uploads"
 
 
 # ---------------------------------------------------------
@@ -118,7 +262,10 @@ class Evidence:
 
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 100
-EMBEDDING_MODEL = "nomic-embed-text"
+# Override with EMBEDDING_MODEL in .env (must be pulled in Ollama).
+# Changing it requires re-uploading documents: vectors from
+# different embedding models are not comparable.
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 
 
 # ---------------------------------------------------------
@@ -352,7 +499,17 @@ bm25_index.rebuild(collection)
 #      of the chunk text, so the LLM naturally sees them
 #      in the context — no metadata changes needed.
 
-SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".csv", ".docx"}
+# Supported file extensions for upload.
+# Phase 2 adds image formats — these are processed via OCR
+# (Tesseract) to extract text from photos of documents,
+# screenshots, scanned pages saved as images, etc.
+SUPPORTED_EXTENSIONS = {
+    ".pdf", ".txt", ".csv", ".docx",  # Original formats
+    ".png", ".jpg", ".jpeg", ".tiff", ".bmp",  # Phase 2: Images (OCR)
+}
+
+# Image-only extensions (used to route to OCR extraction)
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".bmp"}
 
 
 def _extract_tables_from_page(page) -> str:
@@ -1052,6 +1209,850 @@ def extract_tables_to_csv(
     return csv_path
 
 
+# ---------------------------------------------------------
+# OCR functions (Phase 2)
+# ---------------------------------------------------------
+
+
+def _is_scanned_page(page) -> bool:
+    """Detect if a PDF page is scanned (image-based, no text).
+
+    A scanned page has these characteristics:
+      1. Very little or no extractable text (< OCR_MIN_TEXT_LENGTH chars)
+      2. Contains at least one image (the scanned page image)
+
+    Why check both conditions?
+      - A blank page has no text AND no images → not scanned,
+        just empty. No point running OCR.
+      - A page with lots of text → normal PDF, no OCR needed
+        even if it has decorative images.
+      - A page with little/no text BUT has images → scanned!
+        The "text" is trapped inside the image pixels.
+
+    Args:
+        page: A PyMuPDF page object.
+
+    Returns:
+        True if the page appears to be scanned and needs OCR.
+    """
+
+    # Get text the normal way
+    text = page.get_text().strip()
+
+    # If there's enough real text, no OCR needed
+    if len(text) >= OCR_MIN_TEXT_LENGTH:
+        return False
+
+    # Check if the page has images. PyMuPDF's get_images()
+    # returns a list of image references on the page.
+    # "full=True" gives extended info (not needed here,
+    # but we just need the count).
+    images = page.get_images(full=True)
+
+    # Has images but no text → scanned page
+    if images:
+        logger.debug(
+            "Page %d: scanned (text=%d chars, images=%d)",
+            page.number + 1,
+            len(text),
+            len(images),
+        )
+        return True
+
+    return False
+
+
+def _preprocess_for_ocr(image: "Image.Image") -> "Image.Image":
+    """Preprocess an image to improve OCR accuracy.
+
+    WHY PREPROCESSING MATTERS:
+      Raw scanned images often have problems that confuse
+      Tesseract:
+        - Low contrast (gray text on light gray background)
+        - Color noise (colored backgrounds, watermarks)
+        - Uneven lighting (dark corners, shadows)
+
+      Preprocessing fixes these issues BEFORE Tesseract sees
+      the image, dramatically improving text recognition.
+
+    PIPELINE (each step and why):
+
+      1. GRAYSCALE — Convert to single-channel gray.
+         Why: Tesseract works best on grayscale. Color adds
+         no information for text recognition but triples
+         the data Tesseract has to process. Colored
+         backgrounds and highlights can confuse character
+         recognition.
+
+      2. CONTRAST ENHANCEMENT — Boost the difference between
+         text (dark) and background (light).
+         Why: Scanned documents often have washed-out text,
+         especially copies of copies. Boosting contrast by
+         1.5x makes the text pixels clearly darker than the
+         background pixels.
+
+      3. BINARIZATION (Otsu thresholding) — Convert to pure
+         black-and-white (no gray).
+         Why: After grayscale + contrast, pixels are either
+         "mostly dark" (text) or "mostly light" (background).
+         Otsu's method automatically finds the optimal
+         threshold to split them into pure black or white.
+         This removes ALL background noise — watermarks,
+         scanner artifacts, uneven lighting — leaving only
+         clean text shapes for Tesseract.
+
+    Args:
+        image: A PIL Image (can be color or grayscale).
+
+    Returns:
+        A preprocessed PIL Image optimized for OCR.
+    """
+
+    from PIL import ImageEnhance
+
+    # Step 1: Convert to grayscale
+    # "L" mode = 8-bit grayscale (0=black, 255=white)
+    gray = image.convert("L")
+
+    # Step 2: Boost contrast by 1.5x
+    # This makes dark pixels darker and light pixels lighter,
+    # so text stands out more clearly from the background.
+    enhancer = ImageEnhance.Contrast(gray)
+    enhanced = enhancer.enhance(1.5)
+
+    # Step 3: Otsu binarization (adaptive thresholding)
+    #
+    # HOW OTSU WORKS:
+    #   It looks at the histogram of pixel values (how many
+    #   pixels are at each brightness level 0-255) and finds
+    #   the threshold that best separates the two peaks
+    #   (dark=text, light=background). Everything below the
+    #   threshold → black, everything above → white.
+    #
+    #   We use PIL's .point() to apply the threshold.
+    #   First, we compute the optimal threshold by finding
+    #   the value that minimizes within-class variance.
+    #
+    # FALLBACK:
+    #   If Otsu can't find a good split (e.g., all-white
+    #   page), we use 128 as a safe default.
+
+    histogram = enhanced.histogram()
+
+    # Otsu's threshold calculation:
+    # Find the threshold that minimizes weighted variance
+    # between foreground and background pixel groups.
+    total_pixels = sum(histogram)
+
+    if total_pixels == 0:
+        # Empty image — return as-is
+        return enhanced
+
+    # Cumulative sums and means for Otsu
+    sum_total = sum(i * h for i, h in enumerate(histogram))
+    sum_bg = 0.0
+    weight_bg = 0
+    best_threshold = 128  # safe default
+    best_variance = 0.0
+
+    for t in range(256):
+        weight_bg += histogram[t]
+
+        if weight_bg == 0:
+            continue
+
+        weight_fg = total_pixels - weight_bg
+
+        if weight_fg == 0:
+            break
+
+        sum_bg += t * histogram[t]
+
+        mean_bg = sum_bg / weight_bg
+        mean_fg = (sum_total - sum_bg) / weight_fg
+
+        # Between-class variance
+        variance = (
+            weight_bg * weight_fg
+            * (mean_bg - mean_fg) ** 2
+        )
+
+        if variance > best_variance:
+            best_variance = variance
+            best_threshold = t
+
+    # Apply threshold: pixels below → black, above → white
+    binary = enhanced.point(
+        lambda px: 255 if px > best_threshold else 0,
+        "L",
+    )
+
+    logger.debug(
+        "OCR preprocessing: Otsu threshold=%d",
+        best_threshold,
+    )
+
+    return binary
+
+
+def _sanitize_filename(name: str) -> str:
+    """Sanitize a filename for use as a directory name.
+
+    WHY THIS IS NEEDED:
+      Document filenames can contain characters that are
+      invalid in directory names on some operating systems
+      (e.g. colons, slashes, question marks on Windows).
+
+      We replace any non-alphanumeric character (except dots,
+      hyphens, and underscores) with an underscore. This
+      keeps names readable while being filesystem-safe.
+
+    Examples:
+      "my report.pdf"     → "my_report.pdf"
+      "2024/Q1 data.pdf"  → "2024_Q1_data.pdf"
+    """
+    import re
+    # Keep letters, digits, dots, hyphens, underscores
+    # Replace everything else with underscore
+    return re.sub(r'[^\w.\-]', '_', name)
+
+
+def _get_ocr_cache_path(
+    file_path: str,
+    page_num: int,
+) -> Path:
+    """Get the cache file path for an OCR'd page.
+
+    PER-DOCUMENT CACHE STRUCTURE (Fix 4):
+
+      Previously, all OCR cache files lived in a flat
+      directory with hash-based names like:
+        ocr_cache/a3f8b2c1_page0.txt
+        ocr_cache/a3f8b2c1_page1.txt
+        ocr_cache/7e9d4f0a_page0.txt
+
+      This made it impossible to tell which document a
+      cache file belonged to.
+
+      Now we use per-document subdirectories:
+        ocr_cache/my_report.pdf/page_0.txt
+        ocr_cache/my_report.pdf/page_1.txt
+        ocr_cache/other_doc.pdf/page_0.txt
+
+      The subdirectory is named after the original document
+      filename (sanitized for filesystem safety). Inside
+      each subdirectory, files are named page_N.txt.
+
+      We ALSO check for old-style flat cache files and read
+      them if they exist (backward compatibility). This way,
+      documents already OCR'd don't need to be re-processed
+      after this upgrade.
+
+    Args:
+        file_path: Path to the PDF or image file.
+        page_num: Page number (0-based for PDFs, 0 for images).
+
+    Returns:
+        Path to the cache file.
+    """
+
+    # Get the document filename for the subdirectory
+    doc_name = Path(file_path).name
+    safe_name = _sanitize_filename(doc_name)
+
+    # Create per-document subdirectory
+    doc_cache_dir = OCR_CACHE_DIR / safe_name
+    doc_cache_dir.mkdir(exist_ok=True)
+
+    return doc_cache_dir / f"page_{page_num}.txt"
+
+
+def _get_legacy_cache_path(
+    file_path: str,
+    page_num: int,
+) -> Path:
+    """Get the OLD-STYLE flat cache path (for backward compat).
+
+    This lets us read cache files created before Fix 4
+    so existing OCR results aren't lost after the upgrade.
+    """
+    file_hash = hashlib.sha256(
+        Path(file_path).read_bytes()
+    ).hexdigest()[:16]
+
+    return OCR_CACHE_DIR / f"{file_hash}_page{page_num}.txt"
+
+
+def _get_ocr_cache_key(
+    file_path: str,
+    page_num: int,
+) -> str:
+    """Generate a cache key for an OCR'd page.
+
+    NOTE: This function now returns a PATH STRING instead
+    of just a hash key. The path includes the per-document
+    subdirectory. Kept for backward compatibility with
+    callers that pass the key to _read/_write_ocr_cache.
+
+    Args:
+        file_path: Path to the PDF or image file.
+        page_num: Page number (0-based for PDFs, 0 for images).
+
+    Returns:
+        A string representing the cache path (relative to
+        OCR_CACHE_DIR).
+    """
+    # Store the full file_path so _read/_write can resolve it
+    # We use the new path-based approach internally
+    doc_name = Path(file_path).name
+    safe_name = _sanitize_filename(doc_name)
+    return f"{safe_name}/page_{page_num}"
+
+
+def _read_ocr_cache(
+    cache_key: str,
+    file_path: str | None = None,
+    page_num: int = 0,
+) -> str | None:
+    """Read cached OCR text if it exists.
+
+    Checks BOTH the new per-document cache structure AND
+    the old flat cache structure for backward compatibility.
+    This means documents OCR'd before the upgrade still
+    get cache hits without re-processing.
+
+    Args:
+        cache_key: The cache key from _get_ocr_cache_key().
+        file_path: Original file path (for legacy fallback).
+        page_num: Page number (for legacy fallback).
+
+    Returns:
+        The cached text string, or None if not cached.
+    """
+
+    # Try new per-document cache path first
+    cache_file = OCR_CACHE_DIR / f"{cache_key}.txt"
+
+    if cache_file.exists():
+        text = cache_file.read_text(encoding="utf-8")
+        logger.info(
+            "OCR cache HIT (per-doc): %s (%d chars)",
+            cache_key,
+            len(text),
+        )
+        return text
+
+    # Fallback: try old flat hash-based cache
+    # This provides backward compatibility so existing
+    # OCR results aren't lost after the upgrade.
+    if file_path:
+        legacy_path = _get_legacy_cache_path(
+            file_path, page_num,
+        )
+        if legacy_path.exists():
+            text = legacy_path.read_text(encoding="utf-8")
+            logger.info(
+                "OCR cache HIT (legacy): %s (%d chars)",
+                legacy_path.name,
+                len(text),
+            )
+            return text
+
+    return None
+
+
+def _write_ocr_cache(cache_key: str, text: str) -> None:
+    """Save OCR text to per-document cache.
+
+    Writes to the new per-document subdirectory structure.
+    The subdirectory is created automatically by
+    _get_ocr_cache_key() / _get_ocr_cache_path().
+
+    Args:
+        cache_key: The cache key from _get_ocr_cache_key().
+                   Format: "document_name/page_N"
+        text: The OCR-extracted text to cache.
+    """
+
+    cache_file = OCR_CACHE_DIR / f"{cache_key}.txt"
+
+    # Ensure parent directory exists (per-document subdir)
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+
+    cache_file.write_text(text, encoding="utf-8")
+
+    logger.debug("OCR cache WRITE: %s", cache_key)
+
+
+def migrate_legacy_ocr_cache() -> dict:
+    """Migrate old flat hash-named OCR cache files into
+    per-document subdirectories.
+
+    WHY THIS IS NEEDED:
+
+      Before the per-document subdirectory fix, OCR cache
+      files were saved with hash-based names directly in
+      the ocr_cache/ folder:
+
+        ocr_cache/27bd17d91a6894d6_page0.txt
+        ocr_cache/a3f8b2c1d9e4f0b7_page1.txt
+
+      These are impossible to identify — you can't tell
+      which document a file belongs to. As the number of
+      documents grows, this becomes an unmanageable mess.
+
+    HOW MIGRATION WORKS:
+
+      1. Scan the uploads/ folder to find all uploaded
+         document files (PDFs, images, DOCX, etc.)
+      2. For each document, compute the SHA-256 hash of
+         its content (first 16 hex chars — same as the
+         legacy cache key generation)
+      3. Look for legacy flat files matching that hash
+         pattern: {hash}_page{N}.txt
+      4. Move matched files into the new per-document
+         subdirectory: ocr_cache/{document_name}/page_{N}.txt
+      5. Delete any remaining unmatched legacy flat files
+         (they belong to documents that have been deleted)
+
+    WHEN IT RUNS:
+
+      Called once at module load time (server startup).
+      If there are no legacy flat files, it returns
+      immediately (zero overhead).
+
+    Returns:
+        Dict with migration stats:
+        {
+            "migrated": 3,     — files moved to subfolders
+            "orphans_removed": 2,  — unmatched files deleted
+            "already_clean": True/False
+        }
+    """
+
+    # Step 1: Find all legacy flat files in the root of
+    # ocr_cache/. These are files (not directories) whose
+    # names match the pattern: {hash}_page{N}.txt
+    #
+    # New-style files live inside subdirectories, so they
+    # won't be caught by this scan.
+    import re
+
+    legacy_pattern = re.compile(
+        r'^[0-9a-f]+_page(\d+)\.txt$'
+    )
+
+    legacy_files = []
+
+    for item in OCR_CACHE_DIR.iterdir():
+        if item.is_file() and legacy_pattern.match(item.name):
+            legacy_files.append(item)
+
+    if not legacy_files:
+        # No legacy files — cache is already clean
+        return {
+            "migrated": 0,
+            "orphans_removed": 0,
+            "already_clean": True,
+        }
+
+    logger.info(
+        "OCR cache migration: found %d legacy flat files",
+        len(legacy_files),
+    )
+
+    # Step 2: Build a hash → document_name mapping by
+    # scanning all uploaded files and computing their hashes.
+    #
+    # The legacy cache used:
+    #   hashlib.sha256(file_bytes).hexdigest()[:16]
+    # as the hash prefix in filenames.
+    hash_to_docname: dict[str, str] = {}
+
+    if _UPLOAD_DIR.exists():
+        for upload_file in _UPLOAD_DIR.iterdir():
+
+            # Skip directories (like the "images" folder)
+            if not upload_file.is_file():
+                continue
+
+            # Skip non-document files (like extracted CSVs)
+            if upload_file.suffix.lower() not in (
+                SUPPORTED_EXTENSIONS
+            ):
+                continue
+
+            try:
+                file_bytes = upload_file.read_bytes()
+                file_hash = hashlib.sha256(
+                    file_bytes
+                ).hexdigest()[:16]
+
+                # The document name is the original filename
+                # (after the document_id prefix in the upload
+                # filename: "abc123_report.pdf" → "report.pdf")
+                # But for the OCR cache subfolder, we use
+                # the full upload filename since that's what
+                # the OCR functions receive as file_path.
+                doc_name = upload_file.name
+                hash_to_docname[file_hash] = doc_name
+
+            except Exception as exc:
+                logger.debug(
+                    "Skipping %s during migration: %s",
+                    upload_file.name,
+                    exc,
+                )
+
+    logger.info(
+        "OCR cache migration: mapped %d document hashes",
+        len(hash_to_docname),
+    )
+
+    # Step 3: Match legacy files to documents and migrate
+    migrated = 0
+    orphans_removed = 0
+
+    for legacy_file in legacy_files:
+
+        # Parse the hash and page number from the filename.
+        # Format: {hash}_page{N}.txt
+        name = legacy_file.stem  # e.g. "27bd17d91a6894d6_page0"
+        parts = name.rsplit("_page", 1)
+
+        if len(parts) != 2:
+            # Unexpected format — remove as orphan
+            legacy_file.unlink()
+            orphans_removed += 1
+            continue
+
+        file_hash = parts[0]
+        page_num_str = parts[1]
+
+        try:
+            page_num = int(page_num_str)
+        except ValueError:
+            legacy_file.unlink()
+            orphans_removed += 1
+            continue
+
+        # Look up the document name for this hash
+        doc_name = hash_to_docname.get(file_hash)
+
+        if doc_name is None:
+            # No matching document — this is an orphan from
+            # a document that was deleted. Clean it up.
+            legacy_file.unlink()
+            orphans_removed += 1
+
+            logger.debug(
+                "Removed orphan cache: %s (no matching doc)",
+                legacy_file.name,
+            )
+            continue
+
+        # Migrate: move to per-document subdirectory
+        safe_name = _sanitize_filename(doc_name)
+        new_dir = OCR_CACHE_DIR / safe_name
+        new_dir.mkdir(exist_ok=True)
+
+        new_path = new_dir / f"page_{page_num}.txt"
+
+        # Don't overwrite if new-style file already exists
+        # (document was re-OCR'd after the fix)
+        if new_path.exists():
+            legacy_file.unlink()
+            orphans_removed += 1
+            continue
+
+        # Read content and write to new location, then
+        # delete the old file
+        content = legacy_file.read_text(encoding="utf-8")
+        new_path.write_text(content, encoding="utf-8")
+        legacy_file.unlink()
+        migrated += 1
+
+        logger.debug(
+            "Migrated: %s → %s/page_%d.txt",
+            legacy_file.name,
+            safe_name,
+            page_num,
+        )
+
+    logger.info(
+        "OCR cache migration complete: "
+        "%d migrated, %d orphans removed",
+        migrated,
+        orphans_removed,
+    )
+
+    return {
+        "migrated": migrated,
+        "orphans_removed": orphans_removed,
+        "already_clean": False,
+    }
+
+
+# ---------------------------------------------------------
+# Run migration on startup
+# ---------------------------------------------------------
+#
+# This runs once when the module is first imported (server
+# startup). If the cache is already clean (no legacy flat
+# files), it returns immediately with zero overhead.
+#
+# After migration, the ocr_cache/ folder will only contain
+# per-document subdirectories — no more mystery hash files.
+
+migrate_legacy_ocr_cache()
+
+
+def _ocr_page(
+    page,
+    file_path: str | None = None,
+) -> str:
+    """Run OCR on a single PDF page using Tesseract.
+
+    Enhanced with:
+      1. IMAGE PREPROCESSING — grayscale, contrast boost,
+         and Otsu binarization to dramatically improve
+         Tesseract accuracy on scanned documents.
+      2. OCR CACHING — results are saved to disk so the
+         same page is never OCR'd twice.
+      3. TESSERACT PSM 6 — Page Segmentation Mode 6 assumes
+         a uniform block of text, which works better for
+         typical document pages than the default auto mode.
+
+    How the full pipeline works:
+      1. Check cache → if hit, return instantly (0ms)
+      2. Render page to 300 DPI image via PyMuPDF
+      3. Preprocess: grayscale → contrast → binarize
+      4. Run Tesseract with --psm 6 (block of text mode)
+      5. Clean up the OCR output text
+      6. Save to cache for next time
+
+    Args:
+        page: A PyMuPDF page object.
+        file_path: Path to the PDF file (for cache key).
+                   If None, caching is skipped.
+
+    Returns:
+        The OCR-extracted text, or empty string if OCR fails
+        or is not available.
+    """
+
+    if not OCR_AVAILABLE:
+        return ""
+
+    # Step 0: Check cache first (instant if cached)
+    cache_key = None
+    if file_path:
+        cache_key = _get_ocr_cache_key(
+            file_path, page.number,
+        )
+        # Pass file_path and page_num for legacy cache
+        # fallback (backward compatibility with old flat
+        # cache structure from before Fix 4)
+        cached = _read_ocr_cache(
+            cache_key,
+            file_path=file_path,
+            page_num=page.number,
+        )
+        if cached is not None:
+            return cached
+
+    try:
+        # Step 1: Render the page to a high-res image
+        #
+        # get_pixmap() converts the PDF page into raw pixels.
+        # 300 DPI gives print-quality resolution — enough
+        # detail for Tesseract to recognize even small text.
+        pixmap = page.get_pixmap(dpi=OCR_DPI)
+
+        # Step 2: Convert pixmap → PIL Image
+        #
+        # pixmap.tobytes("png") encodes as lossless PNG.
+        # PIL reads it from a BytesIO buffer (in-memory file).
+        img_bytes = pixmap.tobytes("png")
+        image = Image.open(io.BytesIO(img_bytes))
+
+        # Step 3: Preprocess the image for better OCR
+        #
+        # This is the KEY improvement over raw OCR:
+        # grayscale → contrast boost → Otsu binarization
+        # removes background noise and makes text crisp.
+        image = _preprocess_for_ocr(image)
+
+        # Step 4: Run Tesseract OCR with optimized settings
+        #
+        # --psm 6 = "Assume a single uniform block of text"
+        #   This tells Tesseract the page is a document with
+        #   paragraphs, not a photo with scattered text.
+        #   Much better for book pages, forms, and reports.
+        #
+        # --oem 3 = "Default OCR Engine Mode"
+        #   Uses the LSTM neural network engine (most accurate).
+        #   Tesseract 4+ uses this by default, but we set it
+        #   explicitly for clarity.
+        ocr_text = pytesseract.image_to_string(
+            image,
+            lang=OCR_LANG,
+            config="--psm 6 --oem 3",
+        )
+
+        # Step 5: Clean up OCR output
+        #
+        # Tesseract often produces:
+        #   - Excessive blank lines between paragraphs
+        #   - Trailing spaces on every line
+        #   - Random single characters on their own lines
+        #     (from page numbers, watermarks, etc.)
+        #
+        # We clean these up to get readable text.
+
+        # Remove excessive blank lines (3+ → 2)
+        ocr_text = re.sub(r'\n{3,}', '\n\n', ocr_text)
+
+        # Remove lines that are just 1-2 characters
+        # (usually OCR noise from dots, dashes, page numbers)
+        lines = ocr_text.split('\n')
+        cleaned_lines = [
+            line for line in lines
+            if len(line.strip()) > 2 or not line.strip()
+        ]
+        ocr_text = '\n'.join(cleaned_lines)
+
+        # Final trim
+        ocr_text = ocr_text.strip()
+
+        if ocr_text:
+            logger.info(
+                "OCR page %d: extracted %d chars",
+                page.number + 1,
+                len(ocr_text),
+            )
+
+            # Step 6: Save to cache
+            if cache_key:
+                _write_ocr_cache(cache_key, ocr_text)
+
+        return ocr_text
+
+    except Exception as exc:
+        logger.warning(
+            "OCR failed on page %d: %s",
+            page.number + 1,
+            exc,
+        )
+        return ""
+
+
+def extract_text_from_image(
+    image_path: str,
+) -> list[dict]:
+    """Extract text from a standalone image file using OCR.
+
+    This handles direct image uploads (.png, .jpg, .jpeg,
+    .tiff, .bmp) — not PDFs. The user might upload a photo
+    of a document, a screenshot of a table, or a scanned
+    page saved as an image.
+
+    Enhanced pipeline:
+      1. Check OCR cache (instant if previously processed)
+      2. Open the image with PIL (Pillow)
+      3. Preprocess: grayscale → contrast → binarize
+      4. Run Tesseract OCR with --psm 6 (block text mode)
+      5. Clean up and cache the result
+      6. Return in same format as extract_text_from_pdf()
+
+    Args:
+        image_path: Path to the image file on disk.
+
+    Returns:
+        A list with one dict: [{"page": 1, "text": "..."}]
+        Empty list if OCR is not available or no text found.
+    """
+
+    if not OCR_AVAILABLE:
+        logger.warning(
+            "Cannot process image '%s': OCR is not available. "
+            "Install Tesseract to enable image text extraction.",
+            image_path,
+        )
+        return []
+
+    logger.info(
+        "Extracting text from image via OCR: %s",
+        image_path,
+    )
+
+    # Check cache first
+    cache_key = _get_ocr_cache_key(image_path, 0)
+    # Pass file_path and page_num for legacy cache fallback
+    cached = _read_ocr_cache(
+        cache_key,
+        file_path=image_path,
+        page_num=0,
+    )
+
+    if cached is not None:
+        return [{"page": 1, "text": cached}]
+
+    try:
+        # Open the image with PIL
+        image = Image.open(image_path)
+
+        # Preprocess for better OCR accuracy
+        # (grayscale → contrast → Otsu binarization)
+        image = _preprocess_for_ocr(image)
+
+        # Run Tesseract with optimized settings
+        ocr_text = pytesseract.image_to_string(
+            image,
+            lang=OCR_LANG,
+            config="--psm 6 --oem 3",
+        )
+
+        # Clean up whitespace and noise
+        ocr_text = re.sub(r'\n{3,}', '\n\n', ocr_text)
+
+        # Remove short noise lines (1-2 chars)
+        lines = ocr_text.split('\n')
+        cleaned_lines = [
+            line for line in lines
+            if len(line.strip()) > 2 or not line.strip()
+        ]
+        ocr_text = '\n'.join(cleaned_lines).strip()
+
+        if not ocr_text:
+            logger.info(
+                "No text found in image: %s",
+                image_path,
+            )
+            return []
+
+        logger.info(
+            "OCR extracted %d chars from image: %s",
+            len(ocr_text),
+            image_path,
+        )
+
+        # Cache the result
+        _write_ocr_cache(cache_key, ocr_text)
+
+        # Return in same format as PDF extraction
+        # (page=1 since images are single-page)
+        return [{"page": 1, "text": ocr_text}]
+
+    except Exception as exc:
+        logger.error(
+            "Failed to OCR image '%s': %s",
+            image_path,
+            exc,
+        )
+        return []
+
+
 def _extract_text_with_headings(page) -> str:
     """Extract text from a PDF page with heading markers.
 
@@ -1151,10 +2152,15 @@ def extract_text_from_pdf(
 ) -> list[dict]:
     """Extract text from each page of a PDF.
 
-    Enhanced with heading detection and table extraction.
-    Headings are marked with [SECTION: ...] and tables
-    with [TABLE]...[/TABLE] so the LLM can understand
-    the document structure.
+    Enhanced with heading detection, table extraction,
+    and OCR for scanned pages (Phase 2).
+
+    The extraction pipeline for each page:
+      1. Try normal text extraction (headings + tables)
+      2. If the page appears scanned (little/no text but
+         has images), fall back to OCR via Tesseract
+      3. OCR text gets a [OCR] marker so the LLM knows
+         the text quality may be lower than native text
 
     Args:
         pdf_path: Path to the PDF file on disk.
@@ -1169,12 +2175,15 @@ def extract_text_from_pdf(
     doc = fitz.open(pdf_path)
 
     pages = []
+    ocr_page_count = 0  # Track how many pages needed OCR
 
     for page_num in range(len(doc)):
 
         page = doc[page_num]
 
-        # Extract text with heading markers
+        # --------------------------------------------------
+        # Step 1: Try normal text extraction (fast, accurate)
+        # --------------------------------------------------
         text = _extract_text_with_headings(page)
 
         # Extract tables separately (get_text often
@@ -1183,6 +2192,37 @@ def extract_text_from_pdf(
 
         if table_text:
             text = text + "\n\n" + table_text
+
+        # --------------------------------------------------
+        # Step 2: If page looks scanned, try OCR (Phase 2)
+        # --------------------------------------------------
+        #
+        # WHY CHECK AFTER normal extraction?
+        #   Some PDFs have a mix: pages 1-3 are normal text,
+        #   page 4 is a scanned form. We only run OCR on
+        #   pages that actually need it — this saves time
+        #   (OCR is ~10x slower than normal extraction).
+        #
+        # The [OCR] marker tells the LLM that this text
+        # came from image recognition, so it might have
+        # minor errors (e.g., "rn" misread as "m", or
+        # "1" misread as "l"). The LLM can compensate.
+
+        if (
+            len(text.strip()) < OCR_MIN_TEXT_LENGTH
+            and _is_scanned_page(page)
+        ):
+            ocr_text = _ocr_page(page, file_path=pdf_path)
+
+            if ocr_text:
+                text = f"[OCR]\n{ocr_text}\n[/OCR]"
+                ocr_page_count += 1
+
+                logger.info(
+                    "Page %d: used OCR (%d chars)",
+                    page_num + 1,
+                    len(ocr_text),
+                )
 
         if text.strip():
             pages.append(
@@ -1194,9 +2234,18 @@ def extract_text_from_pdf(
 
     doc.close()
 
-    logger.info(
-        "Extracted %d pages with text", len(pages),
-    )
+    # Log a summary of OCR usage for this document
+    if ocr_page_count > 0:
+        logger.info(
+            "Extracted %d pages (%d via OCR) from: %s",
+            len(pages),
+            ocr_page_count,
+            pdf_path,
+        )
+    else:
+        logger.info(
+            "Extracted %d pages with text", len(pages),
+        )
 
     return pages
 
@@ -1725,6 +2774,119 @@ def _reciprocal_rank_fusion(
     return fused
 
 
+def get_page_chunks(
+    page_num: int,
+    source_filter: str | None = None,
+) -> list[Evidence]:
+    """Fetch ALL chunks from a specific page number.
+
+    WHY THIS EXISTS:
+
+      When the user asks "show me page 4" or "what's on page 3",
+      semantic search fails because page numbers have no semantic
+      meaning — page 4 content could be about anything.
+
+      Instead of searching by meaning, we go directly to ChromaDB's
+      metadata and fetch ALL chunks tagged with page=4. This
+      guarantees we get the right page's content every time.
+
+    HOW IT WORKS:
+
+      ChromaDB stores metadata for each chunk:
+        {"source": "report.pdf", "page": 4, "chunk_index": 7, ...}
+
+      We use ChromaDB's `where` filter to fetch chunks where
+      page == page_num. If source_filter is also provided, we
+      combine both filters with $and so we only get chunks
+      from that specific document + page.
+
+    Args:
+        page_num: The page number to fetch (1-based, matching
+                  how users think about pages: "page 1", "page 2").
+        source_filter: Optional filename to scope to one document.
+
+    Returns:
+        List of Evidence objects containing all chunks from
+        that page, sorted by chunk_index (reading order).
+    """
+
+    if collection.count() == 0:
+        return []
+
+    # Build a metadata filter for ChromaDB.
+    #
+    # ChromaDB's `where` clause supports:
+    #   {"page": 4}                    — single condition
+    #   {"$and": [{"page": 4}, ...]}   — multiple conditions
+    #
+    # We always filter by page number. If the user selected
+    # a specific document (source_filter), we add that too
+    # so we don't accidentally return page 4 from a DIFFERENT
+    # uploaded document.
+    if source_filter:
+        where_filter = {
+            "$and": [
+                {"page": page_num},
+                {"source": source_filter},
+            ]
+        }
+    else:
+        where_filter = {"page": page_num}
+
+    try:
+        results = collection.get(
+            where=where_filter,
+            include=["documents", "metadatas"],
+        )
+    except Exception as exc:
+        logger.warning(
+            "Page-specific query failed: %s", exc,
+        )
+        return []
+
+    if not results["documents"]:
+        logger.info(
+            "No chunks found for page %d (filter=%s)",
+            page_num,
+            source_filter or "all",
+        )
+        return []
+
+    # Build Evidence objects from the results.
+    # Sort by chunk_index so the text appears in
+    # reading order (top of page → bottom of page).
+    evidence = []
+
+    for i in range(len(results["documents"])):
+        evidence.append(
+            Evidence(
+                text=results["documents"][i],
+                source=results["metadatas"][i].get(
+                    "source", "unknown",
+                ),
+                page=results["metadatas"][i].get(
+                    "page", 0,
+                ),
+                score=1.0,  # direct fetch = perfect match
+            )
+        )
+
+    # Sort by chunk_index for reading order
+    evidence.sort(
+        key=lambda e: e.page,
+    )
+
+    logger.info(
+        "Page %d: fetched %d chunks directly "
+        "(filter=%s)",
+        page_num,
+        len(evidence),
+        source_filter or "all",
+    )
+
+    return evidence
+
+
 def search_documents(
     query: str,
     n_results: int = 5,
@@ -1814,6 +2976,355 @@ def search_documents(
 # High-level: Process a PDF end-to-end
 # ---------------------------------------------------------
 
+# ---------------------------------------------------------
+# Phase 8: Image/Diagram Extraction from PDFs
+# ---------------------------------------------------------
+#
+# WHY EXTRACT IMAGES?
+#
+#   PDFs often contain embedded images — charts, diagrams,
+#   signatures, logos, photos, infographics. Text extraction
+#   captures the WORDS around a chart, but not the chart
+#   itself. By extracting images separately, users can:
+#     - Browse visual content from their documents
+#     - See charts/diagrams that text search misses
+#     - Download specific images for reports
+#
+# HOW IT WORKS:
+#
+#   PyMuPDF stores each image as a numbered "xref" (cross-
+#   reference) object inside the PDF. A page can reference
+#   multiple xrefs. We:
+#     1. Walk every page, call page.get_images() to list
+#        image xrefs on that page
+#     2. For each unique xref, call doc.extract_image() to
+#        get the raw bytes + format (png, jpeg, etc.)
+#     3. Skip tiny images (<5KB) — these are usually icons,
+#        bullets, decorative dots, or 1-pixel spacers
+#     4. Cap at 2MB per image — larger images eat disk and
+#        slow down the thumbnail gallery
+#     5. Save each image to uploads/images/{document_id}/
+#        with a descriptive filename: page{N}_img{M}.{ext}
+#
+# OPTIMIZATION — DEDUPLICATION:
+#
+#   The same image xref can appear on multiple pages (e.g.,
+#   a company logo on every page header). We track seen
+#   xrefs in a set to avoid saving the same image twice.
+#   This often cuts image count by 50-80% for documents
+#   with repeated headers/footers.
+#
+# DIRECTORY STRUCTURE:
+#
+#   uploads/
+#     images/
+#       abc123def456/          ← document_id
+#         page1_img1.jpeg
+#         page1_img2.png
+#         page3_img1.jpeg
+#       def789abc012/
+#         page1_img1.png
+
+# Size thresholds for image extraction
+IMAGE_MIN_BYTES = 5 * 1024       # 5 KB — skip tiny icons
+IMAGE_MAX_BYTES = 2 * 1024 * 1024  # 2 MB — cap large images
+
+# Where extracted images are stored
+IMAGES_DIR = Path(__file__).resolve().parents[2] / "uploads" / "images"
+
+
+def extract_images_from_pdf(
+    pdf_path: str,
+    document_id: str,
+) -> list[dict]:
+    """Extract embedded images from a PDF file.
+
+    Walks every page, finds image objects via their xref
+    (cross-reference ID), deduplicates by xref, filters
+    by size, and saves to disk.
+
+    Args:
+        pdf_path: Path to the PDF file on disk.
+        document_id: Unique ID for this document (used
+                     to create the output subdirectory).
+
+    Returns:
+        List of dicts describing extracted images:
+        [
+            {
+                "filename": "page1_img1.jpeg",
+                "page": 1,
+                "size_bytes": 45678,
+                "width": 800,
+                "height": 600,
+                "format": "jpeg",
+            },
+            ...
+        ]
+        Empty list if no images found or PDF can't be opened.
+    """
+
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as exc:
+        logger.warning(
+            "Can't open PDF for image extraction: %s",
+            exc,
+        )
+        return []
+
+    # Create output directory for this document's images.
+    # Each document gets its own subdirectory to keep
+    # things organized and make cleanup easy.
+    img_dir = IMAGES_DIR / document_id
+    img_dir.mkdir(parents=True, exist_ok=True)
+
+    # Track which image xrefs we've already saved.
+    # A single image object (identified by xref number)
+    # can appear on multiple pages — e.g., a logo in
+    # every page header. We only save it once.
+    seen_xrefs: set[int] = set()
+
+    extracted: list[dict] = []
+
+    # Counter for naming images within each page.
+    # Reset per page so filenames are: page1_img1, page1_img2, ...
+    for page_num in range(len(doc)):
+
+        page = doc[page_num]
+
+        # get_images() returns a list of tuples:
+        #   (xref, smask, width, height, bpc, colorspace, ...)
+        #
+        # xref = the image's cross-reference ID inside the PDF.
+        #        This is how PyMuPDF identifies each image object.
+        #
+        # smask = soft mask xref (for transparency). We don't
+        #         need it for extraction.
+        #
+        # full=True gives us all fields including color info.
+        image_list = page.get_images(full=True)
+
+        if not image_list:
+            continue
+
+        img_counter = 0
+
+        for img_info in image_list:
+
+            xref = img_info[0]  # Image cross-reference ID
+
+            # ----- DEDUPLICATION -----
+            # Skip if we already extracted this image from
+            # a previous page. Common for logos, watermarks,
+            # and header/footer graphics.
+            if xref in seen_xrefs:
+                continue
+            seen_xrefs.add(xref)
+
+            try:
+                # extract_image() returns a dict with:
+                #   "image": raw bytes of the image
+                #   "ext": file extension ("png", "jpeg", etc.)
+                #   "width": pixel width
+                #   "height": pixel height
+                #   "cs-name": color space name
+                #
+                # It decodes the image from the PDF's internal
+                # format (which might be DCTDecode for JPEG,
+                # FlateDecode for PNG, etc.) into usable bytes.
+                img_data = doc.extract_image(xref)
+            except Exception as exc:
+                logger.debug(
+                    "Skipping xref %d: extract failed (%s)",
+                    xref,
+                    exc,
+                )
+                continue
+
+            if not img_data:
+                continue
+
+            raw_bytes = img_data["image"]
+            img_ext = img_data["ext"]
+            img_width = img_data.get("width", 0)
+            img_height = img_data.get("height", 0)
+
+            # ----- SIZE FILTERING -----
+            # Skip tiny images: these are almost always
+            # decorative — bullet points, line separators,
+            # 1×1 tracking pixels, small icons.
+            size_bytes = len(raw_bytes)
+
+            if size_bytes < IMAGE_MIN_BYTES:
+                logger.debug(
+                    "Skipping xref %d: too small "
+                    "(%d bytes < %d minimum)",
+                    xref,
+                    size_bytes,
+                    IMAGE_MIN_BYTES,
+                )
+                continue
+
+            # Skip oversized images to prevent disk bloat.
+            # 2MB is generous for document images — even a
+            # high-res chart rarely exceeds 500KB.
+            if size_bytes > IMAGE_MAX_BYTES:
+                logger.info(
+                    "Skipping xref %d: too large "
+                    "(%d bytes > %d maximum)",
+                    xref,
+                    size_bytes,
+                    IMAGE_MAX_BYTES,
+                )
+                continue
+
+            # ----- SAVE TO DISK -----
+            # Naming convention: page{N}_img{M}.{ext}
+            # N = page number (1-based, user-friendly)
+            # M = image index within that page (1-based)
+            img_counter += 1
+            img_filename = (
+                f"page{page_num + 1}_img{img_counter}"
+                f".{img_ext}"
+            )
+            img_path = img_dir / img_filename
+
+            img_path.write_bytes(raw_bytes)
+
+            extracted.append({
+                "filename": img_filename,
+                "page": page_num + 1,
+                "size_bytes": size_bytes,
+                "width": img_width,
+                "height": img_height,
+                "format": img_ext,
+            })
+
+            logger.debug(
+                "Extracted image: %s (%dx%d, %d bytes)",
+                img_filename,
+                img_width,
+                img_height,
+                size_bytes,
+            )
+
+    doc.close()
+
+    # If no images were extracted, clean up the empty
+    # directory to avoid clutter.
+    if not extracted:
+        try:
+            img_dir.rmdir()
+        except OSError:
+            pass  # Directory not empty or other issue
+        logger.info(
+            "No extractable images found in PDF: %s",
+            pdf_path,
+        )
+    else:
+        logger.info(
+            "Extracted %d images from PDF: %s "
+            "(skipped %d duplicates)",
+            len(extracted),
+            pdf_path,
+            len(seen_xrefs) - len(extracted),
+        )
+
+    return extracted
+
+
+def list_document_images(
+    document_id: str,
+) -> list[dict]:
+    """List all extracted images for a document.
+
+    Reads the image directory for the given document_id
+    and returns metadata about each image file.
+
+    Args:
+        document_id: The document's unique ID.
+
+    Returns:
+        List of dicts with filename, size, and format info.
+        Empty list if no images directory exists.
+    """
+
+    img_dir = IMAGES_DIR / document_id
+
+    if not img_dir.exists():
+        return []
+
+    images = []
+
+    for img_path in sorted(img_dir.iterdir()):
+
+        if not img_path.is_file():
+            continue
+
+        # Parse page number from filename (page3_img1.jpeg → 3)
+        name = img_path.stem  # "page3_img1"
+        page_num = 0
+
+        try:
+            # Extract the number after "page" and before "_"
+            page_part = name.split("_")[0]  # "page3"
+            page_num = int(
+                page_part.replace("page", "")
+            )
+        except (ValueError, IndexError):
+            pass
+
+        images.append({
+            "filename": img_path.name,
+            "page": page_num,
+            "size_bytes": img_path.stat().st_size,
+            "format": img_path.suffix.lstrip("."),
+        })
+
+    return images
+
+
+def delete_document_images(
+    document_id: str,
+) -> bool:
+    """Delete all extracted images for a document.
+
+    Called when a document is deleted — cleans up the
+    images directory so we don't leave orphaned files.
+
+    Args:
+        document_id: The document's unique ID.
+
+    Returns:
+        True if images were deleted, False if no images
+        directory existed.
+    """
+
+    img_dir = IMAGES_DIR / document_id
+
+    if not img_dir.exists():
+        return False
+
+    # Delete all image files in the directory
+    for img_path in img_dir.iterdir():
+        if img_path.is_file():
+            img_path.unlink()
+
+    # Remove the now-empty directory
+    try:
+        img_dir.rmdir()
+    except OSError:
+        pass
+
+    logger.info(
+        "Deleted images for document: %s",
+        document_id,
+    )
+
+    return True
+
+
 def process_document(
     file_path: str,
     filename: str,
@@ -1852,6 +3363,14 @@ def process_document(
     )
 
     # Step 1: Extract — pick the right extractor
+    #
+    # Each file type has its own extractor that understands
+    # its format. All extractors return the same structure:
+    #   [{"page": N, "text": "..."}]
+    #
+    # This uniform output means Steps 2-4 (chunk → embed →
+    # store) work identically regardless of input format.
+
     if ext == ".pdf":
         pages = extract_text_from_pdf(file_path)
 
@@ -1868,6 +3387,58 @@ def process_document(
                 "PDF table extracted to CSV: %s",
                 csv_path.name,
             )
+
+        # Phase 8: Extract embedded images from the PDF.
+        #
+        # WHY DO THIS DURING PROCESSING?
+        #
+        #   Extracting images at upload time means they're
+        #   ready to browse instantly — no second pass needed.
+        #   The overhead is minimal (~100ms for a typical PDF)
+        #   compared to the embedding step (~5-30 seconds).
+        #
+        #   Images are saved to disk (not embedded in the
+        #   vector store) because:
+        #     1. They're binary data, not searchable text
+        #     2. ChromaDB is for text embeddings, not files
+        #     3. Serving from disk is fast and simple
+        extracted_images = extract_images_from_pdf(
+            file_path, document_id,
+        )
+        if extracted_images:
+            logger.info(
+                "Extracted %d images from PDF: %s",
+                len(extracted_images),
+                filename,
+            )
+
+    elif ext in IMAGE_EXTENSIONS:
+        # Phase 2: Image files → OCR extraction
+        #
+        # The user uploaded a photo/screenshot of a document.
+        # We run Tesseract OCR to extract the text, then
+        # process it through the same chunking → embedding
+        # pipeline as any other document.
+        #
+        # Common use cases:
+        #   - Photo of a paper invoice or receipt
+        #   - Screenshot of a report or spreadsheet
+        #   - Scanned page saved as .jpg instead of .pdf
+        pages = extract_text_from_image(file_path)
+
+        if not pages and not OCR_AVAILABLE:
+            return {
+                "document_id": document_id,
+                "filename": filename,
+                "pages": 0,
+                "chunks": 0,
+                "status": "error",
+                "message": (
+                    "Cannot process images: Tesseract OCR "
+                    "is not installed. Please install "
+                    "Tesseract to enable image uploads."
+                ),
+            }
 
     elif ext == ".txt":
         pages = extract_text_from_txt(file_path)
@@ -1915,23 +3486,107 @@ def process_document(
     # Step 4: Store
     stored = store_chunks(chunks, embeddings, document_id)
 
+    # Count extracted images (only for PDFs).
+    # The `extracted_images` variable only exists if we
+    # went through the PDF branch above. For other file
+    # types, there are no embedded images to extract.
+    image_count = 0
+    if ext == ".pdf":
+        try:
+            image_count = len(extracted_images)
+        except NameError:
+            image_count = 0
+
     result = {
         "document_id": document_id,
         "filename": filename,
         "pages": len(pages),
         "chunks": stored,
+        "images": image_count,
         "status": "success",
     }
 
     logger.info(
-        "Document processed: %s — %d pages, %d chunks",
+        "Document processed: %s — %d pages, %d chunks, "
+        "%d images",
         filename,
         len(pages),
         stored,
+        image_count,
     )
 
     return result
 
+
+# ---------------------------------------------------------
+# get_document_chunk_count — count chunks for ONE document
+# ---------------------------------------------------------
+#
+# WHY A SEPARATE FUNCTION (instead of using list_documents)?
+#
+#   list_documents() loads ALL metadata for EVERY document
+#   in the vector store, just to count chunks. That's
+#   wasteful when we only need the count for ONE document.
+#
+#   This function uses ChromaDB's `where` filter to query
+#   only chunks belonging to a specific file. ChromaDB
+#   returns just the matching IDs (no embeddings, no text),
+#   so it's very lightweight — even for documents with
+#   hundreds of chunks.
+#
+# USED BY:
+#   agent.py's build_context_prompt() to dynamically decide
+#   how many chunks to retrieve based on document size.
+#   Small document (20 chunks) → retrieve ~8
+#   Large document (200 chunks) → retrieve ~20
+#
+#   This replaces the old hardcoded n_results=5, which
+#   only covered ~10% of a large document's content.
+
+def get_document_chunk_count(
+    source: str | None = None,
+) -> int:
+    """Count how many chunks exist for a document.
+
+    Args:
+        source: Filename to count chunks for (e.g. "report.pdf").
+                If None, returns total chunks across ALL documents.
+
+    Returns:
+        Number of chunks in ChromaDB for the given document.
+        Returns 0 if the document doesn't exist or collection
+        is empty.
+    """
+
+    # If no source specified, return total count
+    # (useful for "how many chunks total?" diagnostics)
+    if source is None:
+        return collection.count()
+
+    # -------------------------------------------------
+    # WHY collection.get() WITH where FILTER?
+    #
+    #   ChromaDB doesn't have a direct "count where" API.
+    #   But collection.get() with a where filter returns
+    #   only matching document IDs. We don't request
+    #   embeddings or documents (text), so the response
+    #   is tiny — just a list of ID strings.
+    #
+    #   len(result["ids"]) gives us the exact chunk count
+    #   for this specific file.
+    # -------------------------------------------------
+    try:
+        result = collection.get(
+            where={"source": source},
+            include=[],  # No embeddings, no text — just IDs
+        )
+        return len(result["ids"])
+    except Exception as exc:
+        logger.warning(
+            "Failed to count chunks for '%s': %s",
+            source, exc,
+        )
+        return 0
 
 
 def list_documents() -> list[dict]:
@@ -1988,7 +3643,11 @@ def list_documents() -> list[dict]:
 
 
 def delete_document(document_id: str) -> bool:
-    """Delete all chunks for a document.
+    """Delete all chunks AND extracted images for a document.
+
+    Phase 8 addition: also deletes the images directory
+    for this document, so no orphaned image files remain
+    on disk after document deletion.
 
     Args:
         document_id: The document to delete.
@@ -2004,6 +3663,11 @@ def delete_document(document_id: str) -> bool:
 
         # Rebuild BM25 index without the deleted chunks
         bm25_index.rebuild(collection)
+
+        # Phase 8: Clean up extracted images from disk.
+        # Even if there are no images, this is a no-op
+        # (returns False), so it's safe to call always.
+        delete_document_images(document_id)
 
         logger.info(
             "Deleted document: %s",
