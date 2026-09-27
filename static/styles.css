@@ -15,7 +15,18 @@ body {
     background: #f7f7f8;
     color: #1a1a1a;
     height: 100vh;
+    /* dvh = dynamic viewport height — accounts for mobile
+       browser chrome (address bar, bottom nav bar) that
+       shrinks/expands as the user scrolls. On browsers
+       that don't support dvh, falls back to 100vh. */
+    height: 100dvh;
     overflow: hidden;
+    /* Safe-area padding for notched phones (iPhone X+).
+       env(safe-area-inset-*) returns the distance from
+       the screen edge to where content is safe to display.
+       On non-notched devices, these are 0. */
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
 }
 
 
@@ -26,6 +37,7 @@ body {
 .app-layout {
     display: flex;
     height: 100vh;
+    height: 100dvh;  /* dynamic viewport height for mobile */
 }
 
 
@@ -33,6 +45,19 @@ body {
    SIDEBAR — dark, minimal
    ========================================================== */
 
+/* ---------------------------------------------------------
+   SIDEBAR TOGGLE — ChatGPT-style open/close
+   ---------------------------------------------------------
+   On desktop, the sidebar starts open (visible). Clicking the
+   hamburger button in the chat header toggles the "collapsed"
+   class. When collapsed:
+     - The sidebar slides left off-screen (translateX(-100%))
+     - width and min-width go to 0 so the chat area fills 100%
+     - The transition makes it animate smoothly (0.3s)
+
+   On mobile (<768px), the sidebar is an overlay (position: fixed)
+   with the same toggle behavior — unchanged from before.
+*/
 .sidebar {
     width: 280px;
     min-width: 280px;
@@ -41,7 +66,17 @@ body {
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    transition: transform 0.3s ease;
+    transition: width 0.3s ease,
+                min-width 0.3s ease,
+                transform 0.3s ease;
+}
+
+/* Desktop collapsed state — sidebar slides out,
+   chat area expands to fill the freed space. */
+.sidebar.collapsed {
+    width: 0;
+    min-width: 0;
+    transform: translateX(-100%);
 }
 
 .sidebar-header {
@@ -74,6 +109,28 @@ body {
     font-size: 11px;
     color: #888;
     margin-top: 1px;
+}
+
+/* Close button inside sidebar header — pushes to the right
+   with margin-left: auto. Appears on all screen sizes so
+   users can always collapse the sidebar. */
+.sidebar-close-btn {
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: #888;
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: color 0.15s, background 0.15s;
+}
+
+.sidebar-close-btn:hover {
+    color: #fff;
+    background: #333;
 }
 
 
@@ -131,40 +188,288 @@ body {
     color: #818cf8;
 }
 
+/* --- Upload progress bar ---
+   Phase 1: Background processing with stage-by-stage progress.
+
+   The progress bar now works in TWO modes:
+
+   1. DETERMINATE (width set by JS from polling):
+      The bar smoothly fills from 0% to 100% as the
+      server reports progress_pct at each stage.
+      A subtle shimmer animation shows it's still active.
+
+   2. INITIAL UPLOAD (before task_id is received):
+      While the file is being sent to the server, the
+      bar shows a small pulsing fill at 5%.
+*/
+
 .upload-progress {
     display: none;
     margin-top: 10px;
 }
 
 .upload-progress .progress-bar {
-    height: 3px;
+    height: 4px;
     background: #333;
-    border-radius: 2px;
+    border-radius: 3px;
     overflow: hidden;
 }
 
 .upload-progress .progress-fill {
     height: 100%;
-    background: #6366f1;
     width: 0%;
-    animation: indeterminate 1.5s infinite;
+    border-radius: 3px;
+    /* Green gradient — signals "success / go" */
+    background: linear-gradient(
+        90deg, #22c55e, #4ade80, #22c55e
+    );
+    background-size: 200% 100%;
+    /* Smooth width transitions as progress updates */
+    transition: width 0.6s ease-out;
+    /* Subtle shimmer to show it's still active */
+    animation: progress-shimmer 2s ease-in-out infinite;
 }
 
-@keyframes indeterminate {
-    0%   { width: 0%;  margin-left: 0%;   }
-    50%  { width: 40%; margin-left: 30%;  }
-    100% { width: 0%;  margin-left: 100%; }
+@keyframes progress-shimmer {
+    0%   { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
 }
 
 .upload-progress .progress-text {
     font-size: 11px;
     color: #888;
-    margin-top: 5px;
+    margin-top: 6px;
     text-align: center;
+    /* Smooth text change transitions */
+    transition: opacity 0.2s ease;
 }
 
 #file-input {
     display: none;
+}
+
+
+/* --- Chat history section (sidebar) ---
+   Shows past conversations as a scrollable list.
+   Each conversation item shows:
+     - Auto-generated title (from first question)
+     - Time since last message ("2 min ago")
+     - Delete button (appears on hover)
+
+   The active conversation is highlighted with the
+   same indigo left-border used for selected documents.
+*/
+
+.chat-history-section {
+    border-bottom: 1px solid #2a2a2a;
+    max-height: 40%;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.chat-history-header {
+    padding: 10px 14px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #777;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    border-bottom: 1px solid #2a2a2a;
+    background: #171717;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+}
+
+
+/* ---------------------------------------------------------
+   COLLAPSIBLE SECTIONS — click header to toggle content
+   ---------------------------------------------------------
+   Both "Chat History" and "Documents" headers are now
+   clickable. Clicking toggles the section content between
+   visible and hidden.
+
+   HOW THE ANIMATION WORKS:
+     - .collapsible-content has max-height set to a large
+       value (500px) when expanded. CSS transitions animate
+       the change smoothly.
+     - When .collapsed is added to the parent section,
+       max-height becomes 0 and overflow: hidden clips it.
+     - The chevron arrow rotates 90° (pointing down when
+       expanded, right when collapsed).
+
+   WHY max-height INSTEAD OF height?
+     CSS cannot transition from height: auto to height: 0.
+     max-height CAN be transitioned. We set a max-height
+     large enough to fit the content (500px). The actual
+     height stays at auto — max-height just provides the
+     "from" value for the animation.
+*/
+
+/* Clickable header — cursor shows it's interactive */
+.collapsible-header {
+    cursor: pointer;
+    user-select: none;  /* prevent text selection on click */
+    gap: 6px;
+}
+
+.collapsible-header:hover {
+    background: #1e1e1e;
+}
+
+/* Chevron arrow — rotates when section is expanded */
+.section-chevron {
+    flex-shrink: 0;
+    transition: transform 0.3s ease;
+    transform: rotate(90deg);  /* Default: expanded (pointing down) */
+}
+
+/* When section is collapsed, chevron points right (0°) */
+.collapsed .section-chevron {
+    transform: rotate(0deg);
+}
+
+/* Content area — animates between visible and hidden */
+.collapsible-content {
+    max-height: 500px;
+    overflow-y: auto;
+    transition: max-height 0.3s ease,
+                opacity 0.3s ease;
+    opacity: 1;
+}
+
+/* Collapsed content — hidden with smooth animation */
+.collapsed .collapsible-content {
+    max-height: 0;
+    opacity: 0;
+    overflow: hidden;
+}
+
+/* "New Chat" button — small plus icon */
+.new-chat-btn {
+    background: none;
+    border: 1px solid #444;
+    color: #aaa;
+    cursor: pointer;
+    padding: 4px 6px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+}
+
+.new-chat-btn:hover {
+    border-color: #6366f1;
+    color: #818cf8;
+    background: rgba(99, 102, 241, 0.1);
+}
+
+/* Scrollable list of past conversations.
+   Now also has .collapsible-content class for the
+   collapse animation — max-height and overflow are
+   controlled by that class. flex: 1 is kept so it
+   fills remaining sidebar space when expanded. */
+#chat-list {
+    flex: 1;
+}
+
+#chat-list::-webkit-scrollbar {
+    width: 4px;
+}
+#chat-list::-webkit-scrollbar-thumb {
+    background: #444;
+    border-radius: 2px;
+}
+
+/* Individual conversation item */
+.chat-item {
+    padding: 10px 14px;
+    border-bottom: 1px solid #222;
+    cursor: pointer;
+    transition: background 0.15s;
+    border-left: 3px solid transparent;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.chat-item:hover {
+    background: #1e1e1e;
+}
+
+/* Currently active conversation */
+.chat-item.active {
+    border-left-color: #6366f1;
+    background: #1e1e2e;
+}
+
+.chat-item.active:hover {
+    background: #252538;
+}
+
+/* Chat icon (speech bubble) */
+.chat-item-icon {
+    font-size: 14px;
+    opacity: 0.5;
+    flex-shrink: 0;
+}
+
+/* Title and timestamp container */
+.chat-item-info {
+    flex: 1;
+    min-width: 0;
+}
+
+/* Conversation title — truncated to one line */
+.chat-item-title {
+    font-size: 13px;
+    font-weight: 500;
+    color: #e0e0e0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Relative timestamp ("2 min ago") */
+.chat-item-time {
+    font-size: 11px;
+    color: #666;
+    margin-top: 2px;
+}
+
+/* Delete button — hidden until hover */
+.chat-delete {
+    background: none;
+    border: none;
+    color: #555;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    transition: all 0.15s;
+    flex-shrink: 0;
+    opacity: 0;
+}
+
+.chat-item:hover .chat-delete {
+    opacity: 1;
+}
+
+.chat-delete:hover {
+    color: #ef4444;
+    background: rgba(239, 68, 68, 0.1);
+}
+
+/* Empty state message */
+.chat-empty {
+    padding: 18px 14px;
+    text-align: center;
+    color: #666;
+    font-size: 12px;
+    line-height: 1.6;
 }
 
 
@@ -196,6 +501,8 @@ body {
     background: #171717;
     position: sticky;
     top: 0;
+    display: flex;
+    align-items: center;
 }
 
 .doc-item {
@@ -316,9 +623,16 @@ body {
     color: #333;
 }
 
-/* Hamburger — hidden on desktop */
+/* Hamburger — NOW VISIBLE ON ALL SCREEN SIZES
+   (was hidden on desktop, only shown on mobile).
+
+   ChatGPT-style: the hamburger opens the sidebar,
+   the X button inside the sidebar closes it. This
+   gives users control over screen real estate —
+   especially useful on smaller laptops or when
+   they want a wider chat area. */
 .hamburger-btn {
-    display: none;
+    display: none;       /* Hidden when sidebar is open */
     background: none;
     border: none;
     font-size: 22px;
@@ -331,6 +645,14 @@ body {
 
 .hamburger-btn:hover {
     background: #eee;
+}
+
+/* Show hamburger when sidebar is collapsed —
+   this is the "re-open" button. JavaScript adds
+   the .sidebar-hidden class to body when the
+   sidebar collapses. */
+body.sidebar-hidden .hamburger-btn {
+    display: flex;
 }
 
 
@@ -560,6 +882,11 @@ body {
 
 .input-wrapper {
     padding: 0 24px 20px;
+    /* Add safe-area padding at the bottom for notched phones
+       (iPhone X+ have a home indicator bar at the bottom).
+       max() picks the larger of our base padding or the safe
+       area inset, so content never sits behind the bar. */
+    padding-bottom: max(20px, env(safe-area-inset-bottom));
     background: #f7f7f8;
 }
 
@@ -586,32 +913,156 @@ body {
     border-color: #e5e5e5;
 }
 
-/* Source filter chip — inside the input bar top */
-.source-filter-row {
+/* ---------------------------------------------------------
+   Usage Counter (Phase 1: Rate Limiting)
+   ---------------------------------------------------------
+   Shows "3/15 questions today" and upload counts below the
+   input bar. Subtle enough not to distract, prominent enough
+   to be noticed when limits are close to being reached.
+
+   The counter changes color as usage increases:
+     - Green (default): plenty of usage remaining
+     - Orange (warning): 80%+ used (e.g., 12/15)
+     - Red (limit):      100% used, input disabled
+
+   WHY BELOW THE INPUT BAR?
+     This follows the pattern used by character counters in
+     Twitter/X and other apps — usage info sits just below
+     the input field where your eyes naturally go after
+     typing.
+   --------------------------------------------------------- */
+
+.usage-counter {
     max-width: 720px;
-    margin: 0 auto 6px;
+    margin: 4px auto 0;
+    padding: 2px 12px;
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: #8e8ea0;
+    line-height: 1.4;
+}
+
+.usage-counter .usage-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.usage-counter .usage-icon {
+    font-size: 12px;
+}
+
+/* Warning state — usage is at 80%+ */
+.usage-counter .usage-warning {
+    color: #f59e0b;
+    font-weight: 500;
+}
+
+/* Limit reached — usage is at 100% */
+.usage-counter .usage-limit {
+    color: #ef4444;
+    font-weight: 600;
+}
+
+/* Limit reached banner — appears when questions or
+   uploads are exhausted. Replaces the normal counter
+   with a prominent, friendly message. */
+.usage-limit-banner {
+    max-width: 720px;
+    margin: 8px auto 0;
+    padding: 10px 16px;
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 10px;
+    color: #dc2626;
+    font-size: 13px;
+    text-align: center;
+    line-height: 1.4;
+}
+
+/* ---------------------------------------------------------
+   Document switcher — clickable file chips above the input.
+
+   Shows each uploaded document as a pill with a file icon.
+   The active document gets a highlighted border and
+   background. "All Documents" chip lets users search
+   across everything.
+
+   Layout: horizontal scrollable row so it works even with
+   many documents without pushing the input down.
+   --------------------------------------------------------- */
+
+.doc-switcher {
+    max-width: 720px;
+    margin: 0 auto 8px;
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 11px;
-    color: #6366f1;
     padding: 0 8px;
+    overflow-x: auto;
+    /* Hide scrollbar but keep scroll functionality */
+    scrollbar-width: none;
+    -ms-overflow-style: none;
 }
 
-.source-filter-row .chip-dot {
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    background: #6366f1;
+.doc-switcher::-webkit-scrollbar {
+    display: none;
+}
+
+/* Individual document chip */
+.doc-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 12px;
+    border-radius: 16px;
+    font-size: 12px;
+    color: #666;
+    background: #f0f0f0;
+    border: 1.5px solid transparent;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.2s ease;
     flex-shrink: 0;
 }
 
-.source-filter-row.all-docs {
-    color: #999;
+.doc-chip:hover {
+    background: #e8e8e8;
+    color: #333;
 }
 
-.source-filter-row.all-docs .chip-dot {
-    background: #bbb;
+/* File type icon inside the chip */
+.doc-chip .chip-icon {
+    font-size: 13px;
+    line-height: 1;
+}
+
+/* Filename text — truncate long names */
+.doc-chip .chip-name {
+    max-width: 150px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Active (selected) chip — green highlight */
+.doc-chip.active {
+    background: #ecfdf5;
+    border-color: #22c55e;
+    color: #15803d;
+    font-weight: 500;
+}
+
+/* "All Documents" chip styling */
+.doc-chip.chip-all {
+    background: #f5f5f5;
+    color: #888;
+}
+
+.doc-chip.chip-all.active {
+    background: #ecfdf5;
+    border-color: #22c55e;
+    color: #15803d;
 }
 
 
@@ -864,11 +1315,117 @@ body {
 
 
 /* ==========================================================
-   RESPONSIVE — Mobile (< 768px)
-   ========================================================== */
+   RESPONSIVE DESIGN — Multi-breakpoint system
+   ==========================================================
 
+   BREAKPOINT STRATEGY:
+   ────────────────────────────────────────────────────────────
+   We use a MOBILE-FIRST-ISH approach with max-width queries:
+
+   1. BASE (no query)    — Desktop (>1024px)
+      Full sidebar + wide chat area. Everything at full size.
+
+   2. @media ≤1024px     — Tablets / small laptops
+      Narrower sidebar, slightly smaller fonts and padding.
+      Sidebar is still inline (not overlay) but slimmer.
+
+   3. @media ≤768px      — Large phones / portrait tablets
+      Sidebar becomes a fixed overlay (slides in from left).
+      Hamburger always visible. Tighter spacing everywhere.
+
+   4. @media ≤480px      — Small phones (iPhone SE, etc.)
+      Maximum space savings. Single-column layouts. Minimum
+      font sizes. Touch-friendly tap targets (≥44px).
+
+   WHY THESE BREAKPOINTS?
+     - 1024px: iPad landscape, smaller laptops (13")
+     - 768px:  iPad portrait, most phone-to-tablet boundary
+     - 480px:  Small phones (older iPhones, budget Androids)
+
+   TOUCH TARGETS:
+     Apple's HIG recommends ≥44×44px touch targets. We ensure
+     all buttons, chips, and interactive elements meet this on
+     mobile (≤768px) for comfortable thumb tapping.
+   ────────────────────────────────────────────────────────────
+*/
+
+
+/* ----------------------------------------------------------
+   TABLET — ≤1024px (iPad landscape, small laptops)
+   ----------------------------------------------------------
+   The sidebar is still inline but narrower. Chat content
+   gets slightly less padding. Everything still fits side
+   by side, just tighter.
+*/
+@media (max-width: 1024px) {
+
+    /* Slim down the sidebar — 240px saves 40px for the chat */
+    .sidebar {
+        width: 240px;
+        min-width: 240px;
+    }
+
+    /* Tighter padding on sidebar elements */
+    .sidebar-header {
+        padding: 14px 12px;
+    }
+
+    .upload-zone {
+        padding: 12px 10px;
+    }
+
+    /* Slightly smaller message area */
+    .message-inner {
+        max-width: 640px;
+        padding: 0 20px;
+    }
+
+    .summary-card {
+        max-width: 640px;
+        padding: 0 20px;
+    }
+
+    .input-bar {
+        max-width: 640px;
+    }
+
+    .suggestion-chips {
+        max-width: 640px;
+    }
+
+    .doc-switcher {
+        max-width: 640px;
+    }
+
+    /* Welcome state: reduce padding */
+    .welcome-state {
+        padding: 40px 20px;
+    }
+
+    .welcome-state h3 {
+        font-size: 18px;
+    }
+
+    .welcome-features {
+        max-width: 420px;
+    }
+}
+
+
+/* ----------------------------------------------------------
+   MOBILE — ≤768px (phones, portrait tablets)
+   ----------------------------------------------------------
+   Major layout shift: sidebar becomes a fixed overlay
+   that slides in from the left. The chat area takes
+   100% width. All spacing tightens. Touch targets grow.
+*/
 @media (max-width: 768px) {
 
+    /* --- SIDEBAR → OVERLAY ---
+       On mobile there's no room for an inline sidebar.
+       It becomes a fixed panel that slides over the chat.
+       The dark overlay behind it lets users tap outside
+       to close (handled by app.js closeSidebar). */
     .sidebar {
         position: fixed;
         left: 0;
@@ -884,39 +1441,1195 @@ body {
         transform: translateX(0);
     }
 
-    .sidebar-overlay.open {
-        display: block;
+    /* Desktop collapse class shouldn't interfere on mobile */
+    .sidebar.collapsed {
+        width: 280px;
+        min-width: 280px;
     }
 
+    .sidebar-overlay.open,
     .sidebar-overlay.visible {
         display: block;
     }
 
+    /* Hamburger always visible on mobile (sidebar is overlay) */
     .hamburger-btn {
         display: flex;
     }
 
+    /* --- TIGHTER SPACING --- */
     .chat-header {
         padding: 10px 14px;
+        gap: 8px;
+    }
+
+    .chat-header h2 {
+        font-size: 13px;
+    }
+
+    .message {
+        padding: 16px 0;
     }
 
     .message-inner {
+        max-width: 100%;
         padding: 0 14px;
+        gap: 10px;
+    }
+
+    .message-avatar {
+        width: 28px;
+        height: 28px;
+        font-size: 12px;
+    }
+
+    .message-content {
+        font-size: 14px;
+        line-height: 1.6;
     }
 
     .summary-card {
+        max-width: 100%;
         padding: 0 14px;
     }
 
+    .summary-card-inner {
+        padding: 14px 16px;
+    }
+
+    .summary-card h3 {
+        font-size: 13px;
+    }
+
+    .summary-card .summary-text,
+    .summary-card .insight-item {
+        font-size: 12px;
+    }
+
+    /* --- INPUT AREA — larger touch targets --- */
     .input-wrapper {
         padding: 0 10px 12px;
     }
 
     .input-bar {
+        max-width: 100%;
         border-radius: 14px;
+        padding: 4px 4px 4px 2px;
     }
 
-    .source-filter-row {
+    .input-bar textarea {
+        font-size: 16px;  /* ≥16px prevents iOS auto-zoom on focus */
+        min-height: 40px;
+        padding: 10px 4px;
+    }
+
+    /* Buttons: minimum 44px touch target (Apple HIG) */
+    .send-btn,
+    .stop-btn {
+        width: 40px;
+        height: 40px;
+    }
+
+    .attach-btn {
+        padding: 10px;
+        min-width: 44px;
+        min-height: 44px;
+    }
+
+    /* --- DOC SWITCHER --- */
+    .doc-switcher {
+        max-width: 100%;
         padding: 0 4px;
     }
+
+    .doc-chip {
+        padding: 6px 10px;
+        font-size: 12px;
+    }
+
+    .doc-chip .chip-name {
+        max-width: 100px;
+    }
+
+    /* --- EXPORT BUTTONS — icon only, hide text --- */
+    .export-btn span {
+        display: none;
+    }
+
+    .export-btn {
+        padding: 8px 10px;
+        min-width: 40px;
+        min-height: 40px;
+        justify-content: center;
+    }
+
+    /* --- SUGGESTION CHIPS — tighter --- */
+    .suggestion-chips {
+        max-width: 100%;
+        padding: 0 8px;
+    }
+
+    .suggestion-chip {
+        font-size: 12px;
+        padding: 8px 14px;
+    }
+
+    /* --- WELCOME STATE — fit smaller screens --- */
+    .welcome-state {
+        padding: 30px 16px;
+    }
+
+    .welcome-icon {
+        font-size: 40px;
+    }
+
+    .welcome-state h3 {
+        font-size: 17px;
+    }
+
+    .welcome-state p {
+        font-size: 13px;
+        max-width: 320px;
+    }
+
+    .welcome-features {
+        max-width: 340px;
+        gap: 8px;
+    }
+
+    .welcome-feature {
+        padding: 8px 12px;
+        font-size: 12px;
+        border-radius: 10px;
+    }
+
+    /* --- TABLES — horizontal scroll on overflow ---
+       Tables can be wider than the screen. The .table-wrapper
+       already has overflow-x: auto, but we ensure the cells
+       don't try to stretch on small screens. */
+    .md-table th,
+    .md-table td {
+        padding: 6px 10px;
+        font-size: 12px;
+    }
+
+    /* --- IMAGE GALLERY — 2 columns on mobile --- */
+    .image-gallery-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    /* --- IMAGE MODAL — use more screen space --- */
+    .image-modal-img {
+        max-width: 95vw;
+        max-height: 90vh;
+        border-radius: 4px;
+    }
+
+    .image-modal-close {
+        top: -8px;
+        right: -8px;
+        width: 36px;
+        height: 36px;
+        font-size: 16px;
+    }
+
+    /* --- TOAST — narrower on mobile --- */
+    #toast-container {
+        left: 50%;
+        transform: translateX(-50%);
+        width: calc(100% - 32px);
+        max-width: 400px;
+    }
+
+    .toast {
+        font-size: 12px;
+        padding: 8px 14px;
+    }
+
+    /* --- COPY BUTTON — always visible on mobile ---
+       Mobile has no hover. Show copy button at reduced
+       opacity, so users know they can tap it. */
+    .copy-btn {
+        opacity: 0.6;
+    }
+
+    /* --- CHAT BLOCKED / WELCOME — center better --- */
+    .chat-blocked {
+        padding: 24px 16px;
+    }
+
+    .chat-blocked h3 {
+        font-size: 15px;
+    }
+
+    .chat-blocked p {
+        font-size: 12px;
+        max-width: 300px;
+    }
+
+    /* --- COLLAPSIBLE SECTIONS — larger touch targets --- */
+    .collapsible-header {
+        padding: 12px 14px;
+        min-height: 44px;
+    }
 }
+
+
+/* ----------------------------------------------------------
+   SMALL PHONES — ≤480px (iPhone SE, budget Androids)
+   ----------------------------------------------------------
+   Maximum space savings. Every pixel counts at 320-480px
+   wide. Further reduce font sizes, padding, and simplify
+   layouts to single columns where possible.
+*/
+@media (max-width: 480px) {
+
+    /* Narrower sidebar overlay for tiny screens */
+    .sidebar {
+        width: 260px;
+        min-width: 260px;
+    }
+
+    .sidebar.collapsed {
+        width: 260px;
+        min-width: 260px;
+    }
+
+    .sidebar-header {
+        padding: 12px 10px;
+        gap: 8px;
+    }
+
+    .sidebar-header h1 {
+        font-size: 14px;
+    }
+
+    .sidebar-header .logo-icon {
+        width: 28px;
+        height: 28px;
+        font-size: 14px;
+    }
+
+    /* Upload zone — compact */
+    .upload-zone {
+        padding: 12px 8px;
+    }
+
+    .upload-icon {
+        font-size: 20px;
+        margin-bottom: 4px;
+    }
+
+    .upload-text {
+        font-size: 11px;
+    }
+
+    /* Chat header — tighter */
+    .chat-header {
+        padding: 8px 10px;
+        gap: 6px;
+    }
+
+    .chat-header h2 {
+        font-size: 12px;
+    }
+
+    .chat-header .status-dot {
+        width: 6px;
+        height: 6px;
+    }
+
+    /* Messages — maximum content area */
+    .message {
+        padding: 12px 0;
+    }
+
+    .message-inner {
+        padding: 0 10px;
+        gap: 8px;
+    }
+
+    .message-avatar {
+        width: 24px;
+        height: 24px;
+        font-size: 11px;
+    }
+
+    .message-content {
+        font-size: 13px;
+        line-height: 1.55;
+    }
+
+    .message-label {
+        font-size: 10px;
+        margin-bottom: 4px;
+    }
+
+    .message-timing {
+        font-size: 10px;
+    }
+
+    /* Input — maximum width usage */
+    .input-wrapper {
+        padding: 0 6px 8px;
+    }
+
+    .input-bar {
+        border-radius: 12px;
+    }
+
+    .input-bar textarea {
+        font-size: 16px;  /* prevent iOS zoom */
+        padding: 8px 2px;
+    }
+
+    /* Summary cards */
+    .summary-card {
+        padding: 0 10px;
+    }
+
+    .summary-card-inner {
+        padding: 12px 14px;
+        border-radius: 8px;
+    }
+
+    /* Doc switcher chips — smaller */
+    .doc-chip {
+        padding: 5px 8px;
+        font-size: 11px;
+        border-radius: 12px;
+    }
+
+    .doc-chip .chip-name {
+        max-width: 70px;
+    }
+
+    /* Suggestion chips — compact pills */
+    .suggestion-chips {
+        gap: 6px;
+        padding: 0 6px;
+    }
+
+    .suggestion-chip {
+        font-size: 11px;
+        padding: 6px 10px;
+        border-radius: 16px;
+    }
+
+    .suggestion-chip::before {
+        font-size: 10px;
+    }
+
+    /* Export buttons — icons only, compact */
+    .export-btn {
+        padding: 6px 8px;
+        min-width: 36px;
+        min-height: 36px;
+    }
+
+    .export-btn svg {
+        width: 14px;
+        height: 14px;
+    }
+
+    /* Welcome state — compact for small screens */
+    .welcome-state {
+        padding: 20px 12px;
+    }
+
+    .welcome-icon {
+        font-size: 36px;
+        margin-bottom: 12px;
+    }
+
+    .welcome-state h3 {
+        font-size: 16px;
+    }
+
+    .welcome-state p {
+        font-size: 12px;
+        max-width: 280px;
+        margin-bottom: 16px;
+    }
+
+    .welcome-features {
+        gap: 6px;
+        max-width: 300px;
+    }
+
+    .welcome-feature {
+        padding: 6px 10px;
+        font-size: 11px;
+        gap: 6px;
+    }
+
+    .welcome-feature-icon {
+        font-size: 14px;
+    }
+
+    /* Tables — even tighter cells */
+    .md-table th,
+    .md-table td {
+        padding: 5px 8px;
+        font-size: 11px;
+    }
+
+    /* Image gallery — 2 columns with smaller gap */
+    .image-gallery-grid {
+        grid-template-columns: repeat(2, 1fr);
+        gap: 4px;
+    }
+
+    .image-thumb-label {
+        font-size: 8px;
+        padding: 1px 3px;
+    }
+
+    /* Sidebar doc items — tighter */
+    .doc-item {
+        padding: 8px 10px;
+        gap: 8px;
+    }
+
+    .doc-name {
+        font-size: 12px;
+    }
+
+    .doc-meta {
+        font-size: 10px;
+    }
+
+    /* Chat history items */
+    .chat-history-header,
+    .doc-list-header {
+        padding: 8px 10px;
+        font-size: 10px;
+    }
+
+    /* Toast — full width minus margins */
+    #toast-container {
+        width: calc(100% - 20px);
+    }
+
+    .toast {
+        font-size: 11px;
+        padding: 8px 12px;
+        border-radius: 8px;
+    }
+
+    /* Modal — fill screen on tiny phones */
+    .image-modal-content {
+        max-width: 96vw;
+    }
+
+    .image-modal-img {
+        max-width: 96vw;
+        border-radius: 2px;
+    }
+
+    /* Copy button — always visible, compact */
+    .copy-btn {
+        opacity: 0.6;
+        padding: 3px 8px;
+        font-size: 10px;
+    }
+}
+
+
+/* ----------------------------------------------------------
+   LANDSCAPE PHONES — short viewport height
+   ----------------------------------------------------------
+   When a phone is in landscape, the height is very limited
+   (~300-400px). The input area + chips can eat most of the
+   visible chat. We reduce vertical padding and cap the
+   suggestion chip area to leave room for messages.
+*/
+@media (max-height: 500px) {
+
+    .chat-header {
+        padding: 6px 14px;
+    }
+
+    .message {
+        padding: 8px 0;
+    }
+
+    .input-wrapper {
+        padding: 0 10px 6px;
+    }
+
+    /* Limit suggestion chips to 1 row in landscape */
+    .suggestion-chips {
+        max-height: 50px;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+    }
+
+    .welcome-state {
+        padding: 16px 12px;
+    }
+
+    .welcome-features {
+        display: none;  /* hide feature pills — no room */
+    }
+}
+
+
+/* ----------------------------------------------------------
+   HIGH-DPI / RETINA ADJUSTMENTS
+   ----------------------------------------------------------
+   On high-DPI screens (2x, 3x), thin borders can look
+   fuzzy. We use hairline borders (0.5px) where supported
+   for crisper lines on retina displays.
+*/
+@media (-webkit-min-device-pixel-ratio: 2),
+       (min-resolution: 192dpi) {
+
+    .message:not(:last-child) {
+        border-bottom-width: 0.5px;
+    }
+
+    .doc-item {
+        border-bottom-width: 0.5px;
+    }
+
+    .input-bar {
+        border-width: 0.5px;
+    }
+
+    .md-table td {
+        border-bottom-width: 0.5px;
+    }
+}
+
+
+/* ==========================================================
+   TOAST NOTIFICATIONS — Phase 6: Non-blocking alerts
+   ==========================================================
+
+   WHY NOT USE BROWSER alert()/confirm()?
+     They freeze the ENTIRE page — JavaScript stops,
+     streaming pauses, and the UI becomes unresponsive.
+     Toasts show feedback without blocking anything.
+
+   The toast container is fixed to the top-center of the
+   viewport. Toasts slide down from above with a smooth
+   CSS transition, stay visible for 3-4 seconds, then
+   fade out and are removed from the DOM.
+*/
+
+#toast-container {
+    position: fixed;
+    top: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9999;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    pointer-events: none;
+}
+
+.toast {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 18px;
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 500;
+    color: #fff;
+    background: #333;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+    pointer-events: auto;
+    /* Start invisible and above viewport */
+    opacity: 0;
+    transform: translateY(-12px);
+    transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+/* Entrance: slide down + fade in */
+.toast.show {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+.toast-icon {
+    font-size: 15px;
+    flex-shrink: 0;
+}
+
+/* Type-specific colors */
+.toast-success {
+    background: #059669;
+}
+
+.toast-error {
+    background: #dc2626;
+}
+
+.toast-info {
+    background: #2563eb;
+}
+
+
+/* ==========================================================
+   COPY BUTTON — Phase 6: One-click copy on AI messages
+   ==========================================================
+
+   Positioned at the top-right of the message content area.
+   Hidden by default, appears on hover over the message.
+   Changes to "Copied!" briefly after clicking.
+*/
+
+.copy-btn {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 10px;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    background: #fff;
+    color: #666;
+    font-size: 11px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s, background 0.15s, color 0.15s;
+    z-index: 5;
+}
+
+/* Show on hover over the message content */
+.message-content:hover .copy-btn,
+.ai-answer:hover .copy-btn {
+    opacity: 1;
+}
+
+.copy-btn:hover {
+    background: #f3f3f3;
+    color: #333;
+    border-color: #bbb;
+}
+
+/* "Copied!" state — green feedback */
+.copy-btn.copied {
+    background: #ecfdf5;
+    border-color: #22c55e;
+    color: #15803d;
+    opacity: 1;
+}
+
+
+/* ==========================================================
+   EXPORT BUTTONS — Phase 7: Chat header export controls
+   ==========================================================
+
+   Small buttons in the chat header for exporting the
+   conversation as HTML or PDF. Styled to match the
+   minimal header aesthetic.
+*/
+
+.export-btn {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 6px 12px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    background: #fff;
+    color: #666;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+    flex-shrink: 0;
+}
+
+.export-btn:hover {
+    background: #f3f3f3;
+    color: #333;
+    border-color: #bbb;
+}
+
+.export-btn svg {
+    flex-shrink: 0;
+}
+
+
+/* ==========================================================
+   PRINT STYLESHEET — Phase 7: PDF export via browser print
+   ==========================================================
+
+   When the user clicks "Export as PDF", we add .print-mode
+   to <body>. This triggers @media print rules that:
+     1. Hide the sidebar, input bar, and buttons
+     2. Make the chat area full-width
+     3. Remove backgrounds and shadows for clean printing
+     4. Show all messages without scrolling
+
+   The user then uses their browser's "Save as PDF" option
+   in the print dialog. This gives professional-quality
+   PDF output with zero dependencies.
+*/
+
+@media print {
+    /* Hide everything except chat messages */
+    .sidebar,
+    .sidebar-overlay,
+    .input-wrapper,
+    .chat-header,
+    .chat-blocked,
+    .copy-btn,
+    .export-btn,
+    .message-status,
+    .message-timing,
+    #toast-container {
+        display: none !important;
+    }
+
+    body {
+        overflow: visible;
+        background: #fff;
+    }
+
+    .app-layout {
+        display: block;
+    }
+
+    .chat-area {
+        overflow: visible;
+        background: #fff;
+    }
+
+    .chat-messages {
+        overflow: visible;
+        display: block !important;
+    }
+
+    .message {
+        page-break-inside: avoid;
+    }
+
+    .message-inner {
+        max-width: 100%;
+    }
+}
+
+/* Also support .print-mode class for programmatic trigger */
+body.print-mode .sidebar,
+body.print-mode .sidebar-overlay,
+body.print-mode .input-wrapper {
+    display: none !important;
+}
+
+body.print-mode .chat-area {
+    overflow: visible;
+}
+
+
+/* ==========================================================
+   PHASE 8: IMAGE GALLERY — Extracted PDF images
+   ==========================================================
+
+   Displays extracted images as a thumbnail grid below each
+   document item in the sidebar. The gallery appears when
+   a document is selected and has embedded images.
+
+   LAYOUT:
+     - Grid of fixed-size thumbnails (60×60px)
+     - 3 columns that adapt to sidebar width
+     - Thumbnails use object-fit: cover for consistent sizing
+     - Page number badge on each thumbnail
+
+   LAZY LOADING:
+     - Thumbnails use loading="lazy" in the HTML
+     - Gallery is hidden (height: 0) until the parent document
+       is selected, preventing off-screen images from loading
+*/
+
+.doc-image-gallery {
+    /* Hidden by default — shown when parent doc is selected */
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.3s ease, padding 0.3s ease;
+    padding: 0 12px;
+}
+
+.doc-image-gallery.visible {
+    max-height: 500px;
+    padding: 8px 12px 12px;
+    overflow-y: auto;
+}
+
+.image-gallery-header {
+    font-size: 11px;
+    font-weight: 600;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+    padding-left: 2px;
+}
+
+.image-gallery-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+}
+
+.image-thumb {
+    position: relative;
+    aspect-ratio: 1;
+    border-radius: 6px;
+    overflow: hidden;
+    cursor: pointer;
+    border: 1px solid #e2e2e8;
+    transition: transform 0.15s, box-shadow 0.15s;
+}
+
+.image-thumb:hover {
+    transform: scale(1.05);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    border-color: #6366f1;
+}
+
+.image-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+/* Page number badge — bottom-right corner of each thumbnail */
+.image-thumb-label {
+    position: absolute;
+    bottom: 2px;
+    right: 2px;
+    background: rgba(0, 0, 0, 0.65);
+    color: #fff;
+    font-size: 9px;
+    font-weight: 600;
+    padding: 1px 4px;
+    border-radius: 3px;
+    line-height: 1.3;
+}
+
+
+/* ==========================================================
+   IMAGE MODAL — Fullscreen overlay for viewing images
+   ==========================================================
+
+   A lightweight modal overlay that shows the full-size image
+   when a thumbnail is clicked. Features:
+     - Dark semi-transparent backdrop
+     - Centered image with max dimensions
+     - Close button (X) in top-right
+     - Closes on Escape key or backdrop click
+     - Fade-in/out animation
+*/
+
+.image-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+    pointer-events: none;
+}
+
+.image-modal.show {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.image-modal-backdrop {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.75);
+}
+
+.image-modal-content {
+    position: relative;
+    max-width: 90vw;
+    max-height: 90vh;
+    z-index: 1;
+}
+
+.image-modal-img {
+    max-width: 90vw;
+    max-height: 85vh;
+    border-radius: 8px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    display: block;
+}
+
+.image-modal-close {
+    position: absolute;
+    top: -12px;
+    right: -12px;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: #fff;
+    border: none;
+    font-size: 16px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    transition: background 0.15s;
+    z-index: 2;
+}
+
+.image-modal-close:hover {
+    background: #f0f0f0;
+}
+
+/* ==========================================================
+   SUGGESTION CHIPS — clickable question buttons that appear
+   above or below the chat input to help the user get started.
+   They give new users ideas for what to ask.
+   ========================================================== */
+
+/* Container: flexbox row that wraps chips, centered like the chat */
+.suggestion-chips {
+    max-width: 720px;
+    margin: 0 auto 10px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 0 8px;
+    animation: fadeIn 0.3s ease-out;
+
+    /* -----------------------------------------------
+       SCROLL-BASED HIDE/SHOW TRANSITION
+       -----------------------------------------------
+       When the user scrolls up to read earlier messages,
+       JavaScript adds the "chips-hidden" class (see
+       app.js scroll listener). This transition makes
+       the chips slide down + fade out smoothly instead
+       of disappearing abruptly.
+
+       opacity:  fades the chips visually
+       max-height: collapses the space they occupied
+       transform: slides them down slightly (feels natural
+                  because they're at the bottom of the screen)
+       transition: 0.3s matches the fadeIn animation speed
+                   for visual consistency
+    */
+    opacity: 1;
+    max-height: 200px;           /* enough for 2-3 rows of chips */
+    transform: translateY(0);
+    transition: opacity 0.3s ease,
+                max-height 0.3s ease,
+                transform 0.3s ease;
+    overflow: hidden;
+}
+
+/* Hidden state — applied when user scrolls up */
+.suggestion-chips.chips-hidden {
+    opacity: 0;
+    max-height: 0;
+    transform: translateY(10px);
+    margin-bottom: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    pointer-events: none;  /* prevent clicking invisible chips */
+}
+
+/* Each chip is a rounded pill button with an icon prefix */
+.suggestion-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-size: 13px;
+    color: #555;
+    background: #fff;
+    border: 1.5px solid #e2e2e8;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    line-height: 1.4;
+    max-width: 100%;
+}
+
+/* Hover: tint toward the brand purple so chips feel interactive */
+.suggestion-chip:hover {
+    border-color: #6366f1;
+    color: #6366f1;
+    background: #f5f3ff;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(99, 102, 241, 0.12);
+}
+
+/* Remove the lift on click so it feels "pressed" */
+.suggestion-chip:active {
+    transform: translateY(0);
+}
+
+/* Sparkle emoji before every chip — pure CSS, no extra HTML needed */
+.suggestion-chip::before {
+    content: '\2728';
+    font-size: 12px;
+    flex-shrink: 0;
+}
+
+/* ==========================================================
+   UI MODERNIZATION — Phase 5 Visual Polish
+   These rules layer on top of existing styles to add depth,
+   motion, and hierarchy without changing the base layout.
+   ========================================================== */
+
+/* --- Enhanced message bubbles with subtle shadows ---
+   A light shadow makes user messages float above the
+   background, improving visual separation in long chats. */
+.message.user {
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.message:not(.user) .message-content {
+    position: relative;
+}
+
+/* --- Enhanced input glow on focus ---
+   This OVERRIDES the earlier .input-bar:focus-within rule
+   (line ~760) via CSS cascade — same specificity, but this
+   one appears later so it wins.  Adds a wider outer ring
+   plus a subtle colored shadow for a modern "glow" effect. */
+.input-bar:focus-within {
+    border-color: #6366f1;
+    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1),
+                0 2px 16px rgba(99, 102, 241, 0.08);
+}
+
+/* --- Upload zone pulse animation on drag ---
+   When a user drags a file over the drop-zone, the border
+   and background pulse so the target is unmistakable. */
+.upload-zone.dragover {
+    animation: upload-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes upload-pulse {
+    0%, 100% { border-color: #6366f1; background: #1f1f2e; }
+    50% { border-color: #818cf8; background: #252540; }
+}
+
+/* --- Document cards with lift effect on hover ---
+   A small rightward shift draws the eye and confirms
+   the card is clickable without needing a color change. */
+.doc-item:hover {
+    background: #1e1e1e;
+    transform: translateX(2px);
+    transition: all 0.2s ease;
+}
+
+/* --- Welcome state styling ---
+   Shown when the chat is empty.  Centers a friendly
+   icon + headline + feature pills to onboard new users. */
+.welcome-state {
+    text-align: center;
+    padding: 60px 24px;
+    animation: fadeIn 0.5s ease-out;
+}
+
+.welcome-icon {
+    font-size: 48px;
+    margin-bottom: 16px;
+    opacity: 0.8;
+}
+
+.welcome-state h3 {
+    font-size: 20px;
+    font-weight: 600;
+    color: #333;
+    margin-bottom: 8px;
+}
+
+.welcome-state p {
+    font-size: 14px;
+    color: #888;
+    max-width: 420px;
+    margin: 0 auto 24px;
+    line-height: 1.6;
+}
+
+/* Feature pills inside the welcome state */
+.welcome-features {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    justify-content: center;
+    max-width: 500px;
+    margin: 0 auto;
+}
+
+.welcome-feature {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: #fff;
+    border: 1px solid #e5e5e5;
+    border-radius: 12px;
+    font-size: 13px;
+    color: #555;
+    transition: all 0.2s;
+}
+
+.welcome-feature:hover {
+    border-color: #6366f1;
+    color: #6366f1;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+}
+
+.welcome-feature-icon {
+    font-size: 16px;
+}
+
+/* --- Smooth transitions on sidebar items ---
+   The small rightward shift mirrors .doc-item:hover for
+   consistency across all list-style elements in the app. */
+.chat-item {
+    transition: all 0.2s ease;
+}
+
+.chat-item:hover {
+    transform: translateX(2px);
+}
+
+/* --- Better typography hierarchy ---
+   The label above each message ("You" / "Assistant") gets
+   small-caps-style treatment for a cleaner visual rhythm. */
+.message-label {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #999;
+    margin-bottom: 8px;
+}
+
+/* --- Status bar enhancements --- */
+.message-status {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+/* (Mobile-specific rules for Phase 8 elements are now
+   included in the comprehensive responsive blocks above.
+   See @media ≤768px and @media ≤480px sections.) */

@@ -66,6 +66,21 @@ You should see both `qwen3:8b` and `nomic-embed-text` in the list.
 
 ---
 
+## Choosing your LLM (local or cloud)
+
+The app works with local Ollama by default. To use another LLM (LM Studio,
+OpenRouter, Gemini, Claude, OpenAI, Groq, or any OpenAI-compatible server):
+
+1. Copy the template: `copy .env.example .env` (macOS/Linux: `cp .env.example .env`)
+2. Set `LLM_PROVIDER`, `LLM_MODELS` and, for cloud providers, your API key.
+3. Test it: `uv run python -m ai_document_agent.llm_provider`
+
+See the README's "Choosing an LLM" section for examples. Embeddings for
+document search always use Ollama (`nomic-embed-text`), so keep Ollama
+installed even when a cloud model answers the questions.
+
+---
+
 ## Project Setup
 
 ### Step 1: Clone the repository

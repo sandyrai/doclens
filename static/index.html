@@ -3,8 +3,43 @@
 
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Document Agent</title>
+    <!-- viewport-fit=cover allows the app to extend behind
+         the notch on iPhone X+ and similar devices. We then
+         use env(safe-area-inset-*) in CSS to add padding so
+         content doesn't get hidden behind the notch/home bar. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>DocLens</title>
+
+    <!-- ==============================================
+         FAVICON — the small icon shown in the browser tab
+         ==============================================
+
+         WHY AN SVG FAVICON?
+
+           Traditional favicons are .ico or .png files that
+           need separate files and multiple sizes (16x16,
+           32x32, etc.). An SVG favicon is:
+
+             1. RESOLUTION-INDEPENDENT — looks crisp on any
+                screen (Retina, 4K, etc.)
+             2. SELF-CONTAINED — embedded as a data URI right
+                in the HTML, no separate file to manage
+             3. TINY — a few hundred bytes vs kilobytes for PNG
+             4. EASY TO EDIT — it's just XML text
+
+         The design: a magnifying glass over a document page,
+         representing "DocLens" — looking into your documents.
+         Uses a gradient from indigo (#4F46E5) to purple
+         (#7C3AED) matching the app's accent colors.
+
+         BROWSER SUPPORT:
+
+           SVG favicons work in Chrome 80+, Firefox 41+,
+           Edge 80+, Safari 15+. Older browsers just show
+           the default/blank tab icon — no harm done.
+    -->
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0%25' stop-color='%234F46E5'/%3E%3Cstop offset='100%25' stop-color='%237C3AED'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='8' y='4' width='32' height='42' rx='4' fill='%23f0f0f5' stroke='%234F46E5' stroke-width='2'/%3E%3Cline x1='14' y1='14' x2='34' y2='14' stroke='%23a5a3c7' stroke-width='2' stroke-linecap='round'/%3E%3Cline x1='14' y1='20' x2='30' y2='20' stroke='%23a5a3c7' stroke-width='2' stroke-linecap='round'/%3E%3Cline x1='14' y1='26' x2='32' y2='26' stroke='%23a5a3c7' stroke-width='2' stroke-linecap='round'/%3E%3Cline x1='14' y1='32' x2='26' y2='32' stroke='%23a5a3c7' stroke-width='2' stroke-linecap='round'/%3E%3Ccircle cx='42' cy='38' r='14' fill='none' stroke='url(%23g)' stroke-width='3'/%3E%3Cline x1='52' y1='48' x2='58' y2='56' stroke='url(%23g)' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+
     <link rel="stylesheet" href="/static/styles.css">
 </head>
 
@@ -21,11 +56,31 @@
     <div class="sidebar" id="sidebar">
 
         <div class="sidebar-header">
-            <div class="logo-icon">&#9889;</div>
+            <div class="logo-icon">&#128269;</div>
             <div>
-                <h1>DocAgent</h1>
-                <p>PDF Analysis with AI</p>
+                <h1>DocLens</h1>
+                <p>AI Document Intelligence</p>
             </div>
+
+            <!-- Close sidebar button — visible on all screen sizes.
+                 Works with the hamburger button in chat-header to
+                 create a ChatGPT-style toggle: hamburger opens,
+                 this X closes. On desktop, the sidebar slides out
+                 and the chat area expands to fill the space. -->
+            <button
+                class="sidebar-close-btn"
+                id="sidebar-close-btn"
+                onclick="closeSidebar()"
+                title="Close sidebar"
+            >
+                <svg viewBox="0 0 24 24" fill="none"
+                     stroke="currentColor" stroke-width="2"
+                     stroke-linecap="round" stroke-linejoin="round"
+                     width="18" height="18">
+                    <line x1="18" y1="6" x2="6" y2="18"/>
+                    <line x1="6" y1="6" x2="18" y2="18"/>
+                </svg>
+            </button>
         </div>
 
         <div class="upload-section">
@@ -38,14 +93,18 @@
                 <div class="upload-icon">&#128206;</div>
                 <div class="upload-text">
                     <strong>Drop files here</strong>
-                    PDF, DOCX, TXT, CSV
+                    PDF, DOCX, TXT, CSV, Images
                 </div>
             </div>
 
+            <!-- Phase 2: Added image formats for OCR support.
+                 When the user uploads an image (.png, .jpg, etc.),
+                 the backend uses Tesseract OCR to extract text
+                 from the image before indexing it. -->
             <input
                 type="file"
                 id="file-input"
-                accept=".pdf,.docx,.txt,.csv"
+                accept=".pdf,.docx,.txt,.csv,.png,.jpg,.jpeg,.tiff,.bmp"
                 multiple
             >
 
@@ -60,13 +119,86 @@
 
         </div>
 
-        <div class="doc-list-section" id="doc-list-section">
-            <div class="doc-list-header">
-                Documents
-                (<span id="doc-count">0</span>)
+        <!-- ============================================
+             CHAT HISTORY — Conversation list
+             ============================================
+             Shows past conversations so users can resume
+             old chats. Each item shows the auto-generated
+             title (from the first question) and when it
+             was last active. Clicking loads that chat.
+             "New Chat" button starts a fresh conversation.
+        -->
+        <!-- ============================================
+             COLLAPSIBLE SECTIONS
+             ============================================
+             Both Chat History and Documents are now
+             collapsible. Clicking the header toggles
+             the content below it — this keeps the sidebar
+             clean when the user doesn't need to see one
+             of the sections.
+
+             HOW IT WORKS:
+               - Each header has a chevron arrow (▸)
+               - Clicking the header adds/removes the
+                 "collapsed" class on the section
+               - CSS hides the content with max-height: 0
+                 and a smooth transition
+               - The chevron rotates 90° when expanded
+        -->
+        <div class="chat-history-section" id="chat-history-section">
+            <div class="chat-history-header collapsible-header"
+                 onclick="toggleSection('chat-history-section')">
+                <!-- Chevron arrow — rotates when expanded -->
+                <svg class="section-chevron" viewBox="0 0 24 24"
+                     fill="none" stroke="currentColor" stroke-width="2"
+                     stroke-linecap="round" stroke-linejoin="round"
+                     width="14" height="14">
+                    <polyline points="9 18 15 12 9 6"/>
+                </svg>
+                <span>Chat History</span>
+
+                <!-- Plus button stays separate — clicks should NOT
+                     trigger collapse (stopPropagation in onclick) -->
+                <button
+                    class="new-chat-btn"
+                    id="new-chat-btn"
+                    onclick="event.stopPropagation(); startNewChat()"
+                    title="Start a new conversation"
+                >
+                    <svg viewBox="0 0 24 24" fill="none"
+                         stroke="currentColor" stroke-width="2"
+                         stroke-linecap="round" stroke-linejoin="round"
+                         width="16" height="16">
+                        <line x1="12" y1="5" x2="12" y2="19"/>
+                        <line x1="5" y1="12" x2="19" y2="12"/>
+                    </svg>
+                </button>
             </div>
 
-            <div id="doc-list">
+            <div class="collapsible-content" id="chat-list">
+                <div class="chat-empty">
+                    No conversations yet.<br>
+                    Ask a question to start.
+                </div>
+            </div>
+        </div>
+
+        <div class="doc-list-section" id="doc-list-section">
+            <div class="doc-list-header collapsible-header"
+                 onclick="toggleSection('doc-list-section')">
+                <svg class="section-chevron" viewBox="0 0 24 24"
+                     fill="none" stroke="currentColor" stroke-width="2"
+                     stroke-linecap="round" stroke-linejoin="round"
+                     width="14" height="14">
+                    <polyline points="9 18 15 12 9 6"/>
+                </svg>
+                <span>
+                    Documents
+                    (<span id="doc-count">0</span>)
+                </span>
+            </div>
+
+            <div class="collapsible-content" id="doc-list">
                 <div class="doc-empty">
                     No documents uploaded yet.<br>
                     Upload a file to get started.
@@ -81,7 +213,7 @@
          ================================================ -->
     <div class="chat-area">
 
-        <!-- Top bar -->
+        <!-- Top bar — Phase 6/7: added export buttons -->
         <div class="chat-header">
             <button class="hamburger-btn" id="hamburger-btn"
                     title="Open sidebar">
@@ -89,17 +221,94 @@
             </button>
             <div class="status-dot"></div>
             <h2>Document Q&A</h2>
+
+            <!-- Spacer pushes export buttons to the right -->
+            <div style="flex: 1;"></div>
+
+            <!-- Phase 7: Export as HTML button -->
+            <button class="export-btn" id="export-html-btn"
+                    onclick="exportConversation('html')"
+                    title="Export as HTML (Ctrl+Shift+E)">
+                <svg viewBox="0 0 24 24" fill="none"
+                     stroke="currentColor" stroke-width="2"
+                     stroke-linecap="round" stroke-linejoin="round"
+                     width="16" height="16">
+                    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                    <polyline points="7 10 12 15 17 10"/>
+                    <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+                <span>HTML</span>
+            </button>
+
+            <!-- Phase 7: Export as PDF (browser print) -->
+            <button class="export-btn" id="export-pdf-btn"
+                    onclick="exportConversation('pdf')"
+                    title="Export as PDF (Print)">
+                <svg viewBox="0 0 24 24" fill="none"
+                     stroke="currentColor" stroke-width="2"
+                     stroke-linecap="round" stroke-linejoin="round"
+                     width="16" height="16">
+                    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+                    <polyline points="14 2 14 8 20 8"/>
+                    <line x1="16" y1="13" x2="8" y2="13"/>
+                    <line x1="16" y1="17" x2="8" y2="17"/>
+                </svg>
+                <span>PDF</span>
+            </button>
         </div>
 
-        <!-- Blocked overlay -->
+        <!-- ============================================
+             WELCOME STATE — Phase 5 UI Modernization
+             ============================================
+             Shown when no documents are uploaded yet.
+             Features an illustrated empty state with
+             feature highlights that tell users what the
+             app can do. More engaging than plain text.
+
+             WHY A WELCOME STATE?
+               A blank screen with "Upload a PDF first..."
+               doesn't tell users WHAT they can do with
+               the app. Feature chips give concrete examples
+               ("Analyze tables", "Generate quizzes") that
+               help users understand the app's capabilities
+               before they even upload a file.
+        -->
         <div class="chat-blocked" id="chat-blocked">
-            <div class="blocked-icon">&#128196;</div>
-            <h3>Upload a document to start</h3>
-            <p>
-                Analyze financial documents, invoices, bank
-                statements, Form 16, student results, and more.
-                Upload a PDF to begin.
-            </p>
+            <div class="welcome-state">
+                <div class="welcome-icon">&#128218;</div>
+                <h3>Welcome to DocLens</h3>
+                <p>
+                    Upload a PDF, DOCX, CSV, or image to get started.
+                    Ask questions, generate quizzes, create flashcards,
+                    and analyze your documents with AI.
+                </p>
+                <div class="welcome-features">
+                    <div class="welcome-feature">
+                        <span class="welcome-feature-icon">&#128269;</span>
+                        Smart search
+                    </div>
+                    <div class="welcome-feature">
+                        <span class="welcome-feature-icon">&#128202;</span>
+                        Table analysis
+                    </div>
+                    <div class="welcome-feature">
+                        <span class="welcome-feature-icon">&#127891;</span>
+                        Quiz generation
+                    </div>
+                    <div class="welcome-feature">
+                        <span class="welcome-feature-icon">&#128221;</span>
+                        Flashcards
+                    </div>
+                    <div class="welcome-feature">
+                        <span class="welcome-feature-icon">&#128196;</span>
+                        Summaries
+                    </div>
+                    <div class="welcome-feature">
+                        <span class="welcome-feature-icon">&#128247;</span>
+                        OCR support
+                    </div>
+                </div>
+            </div>
         </div>
 
         <!-- Chat messages -->
@@ -125,11 +334,37 @@
         <!-- Input area -->
         <div class="input-wrapper" id="input-wrapper">
 
-            <!-- Source filter indicator -->
-            <div class="source-filter-row all-docs"
-                 id="source-filter-chip">
-                <span class="chip-dot"></span>
-                <span id="source-filter-label">Searching: All documents</span>
+            <!-- ============================================
+                 SUGGESTION CHIPS — Phase 4 Smart Suggestions
+                 ============================================
+                 Clickable question pills shown above the input.
+                 Two types:
+                   1. Document suggestions — appear after upload
+                      (e.g., "Summarize this document")
+                   2. Follow-up suggestions — appear after each
+                      AI answer (e.g., "Tell me more about...")
+
+                 Clicking a chip fills the input and sends the
+                 question automatically. This helps users who
+                 don't know what to ask — especially useful for
+                 first-time users or complex documents.
+
+                 The container is populated by app.js via:
+                   - fetchDocumentSuggestions() after upload
+                   - handleStreamEvent() for follow-up suggestions
+            -->
+            <div class="suggestion-chips" id="suggestion-chips">
+                <!-- Chips are injected dynamically by app.js -->
+            </div>
+
+            <!-- Document switcher chips — shows uploaded files
+                 as clickable pills with icons above the input.
+                 User can click a chip to search only that document,
+                 or click "All" to search across everything. -->
+            <div class="doc-switcher" id="doc-switcher">
+                <!-- Chips are injected by app.js via
+                     updateDocumentSwitcher() after each upload
+                     or document deletion. -->
             </div>
 
             <!-- Input bar with attach + textarea + send -->
@@ -189,6 +424,25 @@
                     </svg>
                 </button>
 
+            </div>
+
+            <!-- ============================================
+                 USAGE COUNTER (Phase 1: Rate Limiting)
+                 ============================================
+                 Shows the user how many questions and uploads
+                 they have remaining today. Updates after each
+                 question or upload. When limits are reached,
+                 the input is disabled and a friendly message
+                 appears.
+
+                 WHY SHOW THIS TO THE USER?
+                    Transparency. Users should know:
+                    1. That limits exist (no surprise blocks)
+                    2. How much they've used (plan their questions)
+                    3. When limits reset (come back tomorrow!)
+            -->
+            <div class="usage-counter" id="usage-counter">
+                <!-- Populated by app.js updateUsageDisplay() -->
             </div>
 
         </div>
