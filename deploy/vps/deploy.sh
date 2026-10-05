@@ -71,7 +71,8 @@ wait_healthy() {
 
 deploy_site() {
     [[ -f "$incoming/index.html" ]] || fail "tarball has no index.html"
-    rm -rf "$incoming/.github" "$incoming/README.md" "$incoming/.gitattributes"
+    # Repo-only files that must not be served publicly.
+    rm -rf "$incoming/.github" "$incoming/scripts" "$incoming/README.md" "$incoming/.gitattributes"
 
     mkdir -p "$SITE_BACKUPS"
     local backup="$SITE_BACKUPS/ojasyukti-$(date -u +%Y%m%dT%H%M%SZ)"

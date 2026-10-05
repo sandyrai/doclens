@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------
+# deploy — test locally, then deploy to the OjasYukti VPS
+# ---------------------------------------------------------
+#
+#   deploy ats            test + deploy ATS Tailor
+#   deploy doclens        test + deploy DocLens
+#   deploy site           check + deploy the ojasyukti.tech website
+#   deploy all            all three, stopping at the first failure
+#
+#   --skip-tests          deploy without running tests (emergencies)
+#
+# Works without GitHub: it sends the committed HEAD of your local
+# repo straight to the VPS deploy script over SSH, which rebuilds,
+# health-checks and rolls back on failure (deploy/vps/deploy.sh).
+#
+# Repo locations, SSH key and host can be overridden with the
+# environment variables below.
+# ---------------------------------------------------------
+set -euo pipefail
+
+DOCLENS_DIR="${DOCLENS_DIR:-/e/ai-document-agent}"
+ATS_DIR="${ATS_DIR:-/c/Projects/ats-tailor}"
+SITE_DIR="${SITE_DIR:-/c/Projects/ojasyukti-site}"
+VPS="${VPS:-ojdeploy@93.127.185.236}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/ojasyukti-actions-deploy}"
+
+if [[ -t 1 ]]; then
+    bold=$'\e[1m'; red=$'\e[31m'; green=$'\e[32m'; yellow=$'\e[33m'; reset=$'\e[0m'
+else
+    bold=""; red=""; green=""; yellow=""; reset=""
+fi
+step() { echo "${bold}==> $*${reset}"; }
+warn() { echo "${yellow}warning:${reset} $*"; }
+die()  { echo "${red}error:${reset} $*" >&2; exit 1; }
+
+usage() {
+    sed -n '5,12p' "$0" | sed 's/^# \{0,1\}//'
+    exit 2
+}
+
+skip_tests=false
+services=()
+for arg in "$@"; do
+    case "$arg" in
+        --skip-tests) skip_tests=true ;;
+        ats|doclens|site) services+=("$arg") ;;
+        all) services+=(doclens ats site) ;;
+        -h|--help) usage ;;
+        *) echo "unknown argument: $arg"; usage ;;
+    esac
+done
+[[ ${#services[@]} -gt 0 ]] || usage
+[[ -f "$SSH_KEY" ]] || die "SSH key not found: $SSH_KEY"
+
+repo_dir() {
+    case "$1" in
+        doclens) echo "$DOCLENS_DIR" ;;
+        ats)     echo "$ATS_DIR" ;;
+        site)    echo "$SITE_DIR" ;;
+    esac
+}
+
+# ---- checks before testing ----------------------------------------------
+check_repo() {
+    local dir=$1
+    [[ -d "$dir/.git" ]] || die "not a git repo: $dir (set the *_DIR variable)"
+    cd "$dir"
+
+    # git archive sends the last commit, so uncommitted edits would
+    # silently not be deployed. Make that impossible.
+    if [[ -n "$(git status --porcelain)" ]]; then
+        git status --short
+        die "uncommitted changes in $dir — commit or stash them first"
+    fi
+
+    git fetch -q origin 2>/dev/null || warn "could not reach GitHub to compare branches (deploying anyway)"
+    local upstream ahead=0 behind=0
+    if upstream=$(git rev-parse --abbrev-ref '@{u}' 2>/dev/null); then
+        ahead=$(git rev-list --count "$upstream..HEAD")
+        behind=$(git rev-list --count "HEAD..$upstream")
+    fi
+    if (( behind > 0 )); then
+        die "$(basename "$dir") is $behind commit(s) behind $upstream — pull first, or you'd deploy older code"
+    fi
+    if (( ahead > 0 )); then
+        warn "$ahead commit(s) not pushed yet — the VPS will run code GitHub doesn't have. Push afterwards."
+    fi
+}
+
+# ---- tests --------------------------------------------------------------
+python_bin() {
+    # Windows venvs use Scripts/, Linux/macOS use bin/.
+    if [[ -x .venv/Scripts/python.exe ]]; then echo .venv/Scripts/python.exe
+    elif [[ -x .venv/bin/python ]]; then echo .venv/bin/python
+    fi
+}
+
+test_ats() {
+    local py
+    py=$(python_bin)
+    if [[ -z "$py" ]]; then
+        step "creating ATS virtualenv"
+        python -m venv .venv
+        py=$(python_bin)
+        "$py" -m pip install -q -r requirements.txt pytest httpx
+    fi
+    "$py" -m pytest tests -q -p no:cacheprovider
+}
+
+test_doclens() {
+    # The pgvector tests need Postgres. Use a throwaway test database in
+    # the local compose container when Docker is running; never the dev db.
+    if docker info >/dev/null 2>&1; then
+        docker compose up -d --wait db >/dev/null
+        docker compose exec -T db psql -U doclens -d doclens -qtc \
+            "SELECT 1 FROM pg_database WHERE datname = 'doclens_test'" | grep -q 1 \
+            || docker compose exec -T db createdb -U doclens doclens_test
+        TEST_DATABASE_URL="postgresql://doclens:doclens@127.0.0.1:5432/doclens_test" \
+            uv run pytest tests -q -p no:cacheprovider
+    else
+        warn "Docker isn't running: the 8 pgvector tests will be SKIPPED (CI still runs them)"
+        uv run pytest tests -q -p no:cacheprovider
+    fi
+}
+
+test_site() {
+    python scripts/check_site.py
+}
+
+# ---- deploy -------------------------------------------------------------
+deploy_one() {
+    local service=$1 dir sha
+    dir=$(repo_dir "$service")
+
+    step "$service: checking $dir"
+    check_repo "$dir"
+    sha=$(git rev-parse HEAD)
+    echo "    commit $(git log -1 --format='%h %s')"
+
+    if $skip_tests; then
+        warn "skipping tests (--skip-tests)"
+    else
+        step "$service: running tests"
+        "test_$service" || die "$service tests failed — nothing was deployed"
+    fi
+
+    step "$service: deploying ${sha:0:12} to $VPS"
+    git archive HEAD | ssh -i "$SSH_KEY" -o BatchMode=yes "$VPS" \
+        "SSH_ORIGINAL_COMMAND='deploy $service $sha' ~/ojasyukti-apps/deploy.sh" \
+        || die "$service deploy failed (the VPS keeps or restores the previous version — see its message above)"
+
+    echo "${green}✓ $service deployed${reset}"
+}
+
+for service in "${services[@]}"; do
+    deploy_one "$service"
+done

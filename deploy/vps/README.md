@@ -66,6 +66,41 @@ resumes after `ATS_OUTPUT_RETENTION_HOURS`.
 Until the secrets exist, the deploy step is skipped with a notice and the tests
 still run.
 
+## Deploying from your PC (no GitHub needed)
+
+`deploy/local/deploy` tests locally, then deploys over SSH with your own key.
+It doesn't use GitHub Actions at all, so it keeps working if Actions minutes
+run out or GitHub is down.
+
+```bash
+deploy ats          # test + deploy ATS Tailor
+deploy doclens      # test + deploy DocLens
+deploy site         # check + deploy the website
+deploy all          # all three, stopping at the first failure
+```
+
+For each service it:
+
+1. refuses to run if the repo has uncommitted changes, or is behind GitHub;
+   it warns if the commit isn't pushed yet
+2. runs the tests: pytest for the apps, `scripts/check_site.py` for the site.
+   For DocLens's pgvector tests it uses a `doclens_test` database in the local
+   `docker compose` Postgres if Docker is running, and says they were skipped
+   if it isn't
+3. sends the commit to `deploy.sh` on the VPS, which builds, health-checks and
+   rolls back on failure
+
+`--skip-tests` exists for emergencies. Repo paths, the key and the host can be
+changed with `DOCLENS_DIR`, `ATS_DIR`, `SITE_DIR`, `SSH_KEY` and `VPS`.
+
+To get the one-word `deploy` command in Git Bash, add this to `~/.bashrc`:
+
+```bash
+alias deploy='bash /e/ai-document-agent/deploy/local/deploy'
+```
+
+From PowerShell, use `E:i-document-agent\deploy\local\deploy.ps1 ats`.
+
 ## Deploying by hand
 
 With your normal SSH access:
