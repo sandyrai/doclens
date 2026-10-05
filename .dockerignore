@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+.env
+.env.*
+!.env.example
+.pytest_cache
+__pycache__
+uploads
+chroma_db
+ocr_cache
+data
+docs
+samples
+tests
+*.log
