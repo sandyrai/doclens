@@ -223,6 +223,16 @@ The key travels as a query parameter because browser WebSocket clients can't set
 
 ---
 
+## Deployment
+
+Production runs at https://doclens.ojasyukti.tech with Docker Compose behind
+Caddy, next to ATS Tailor and the OjasYukti website. Pushing to `main` tests and
+deploys automatically, and `deploy/local/deploy doclens` does the same from your
+PC. See **[DEPLOYMENT.md](DEPLOYMENT.md)** for the full runbook: deploying,
+rollback, configuration and first-time setup.
+
+---
+
 ## Security
 
 - Keys live only in `.env`, which is git-ignored; `.env.example` has placeholders.
