@@ -10,9 +10,12 @@
 #
 #   --skip-tests          deploy without running tests (emergencies)
 #
-# Works without GitHub: it sends the committed HEAD of your local
-# repo straight to the VPS deploy script over SSH, which rebuilds,
-# health-checks and rolls back on failure (deploy/vps/deploy.sh).
+# Each run: checks you're on the default branch with nothing
+# uncommitted, pulls the latest commits from GitHub (fast-forward
+# only), runs the tests, then sends that commit to the VPS deploy
+# script over SSH, which rebuilds, health-checks and rolls back on
+# failure (deploy/vps/deploy.sh). If GitHub is unreachable it
+# deploys your local commit and says so.
 #
 # Repo locations, SSH key and host can be overridden with the
 # environment variables below.
@@ -74,17 +77,34 @@ check_repo() {
         die "uncommitted changes in $dir — commit or stash them first"
     fi
 
-    git fetch -q origin 2>/dev/null || warn "could not reach GitHub to compare branches (deploying anyway)"
-    local upstream ahead=0 behind=0
-    if upstream=$(git rev-parse --abbrev-ref '@{u}' 2>/dev/null); then
-        ahead=$(git rev-list --count "$upstream..HEAD")
-        behind=$(git rev-list --count "HEAD..$upstream")
+    # Production always deploys the default branch (main / master).
+    local branch default
+    branch=$(git branch --show-current)
+    default=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    default=${default#origin/}
+    if [[ -n "$default" && "$branch" != "$default" ]]; then
+        die "$(basename "$dir") is on branch '$branch' — switch to '$default' to deploy (git switch $default)"
     fi
-    if (( behind > 0 )); then
-        die "$(basename "$dir") is $behind commit(s) behind $upstream — pull first, or you'd deploy older code"
-    fi
-    if (( ahead > 0 )); then
-        warn "$ahead commit(s) not pushed yet — the VPS will run code GitHub doesn't have. Push afterwards."
+
+    # Pull the latest code from GitHub first, so a deploy always
+    # includes what's been merged there. Fast-forward only: if your
+    # local commits and GitHub's have diverged, stop and let you merge.
+    if git fetch -q origin 2>/dev/null; then
+        local upstream ahead=0 behind=0
+        if upstream=$(git rev-parse --abbrev-ref '@{u}' 2>/dev/null); then
+            behind=$(git rev-list --count "HEAD..$upstream")
+            if (( behind > 0 )); then
+                step "pulling $behind new commit(s) from $upstream"
+                git merge -q --ff-only "$upstream" \
+                    || die "local and GitHub history have diverged in $(basename "$dir") — run 'git pull' and resolve it first"
+            fi
+            ahead=$(git rev-list --count "$upstream..HEAD")
+            if (( ahead > 0 )); then
+                warn "$ahead commit(s) not pushed yet — the VPS will run code GitHub doesn't have. Push afterwards."
+            fi
+        fi
+    else
+        warn "could not reach GitHub — deploying your local $branch without pulling"
     fi
 }
 
@@ -103,8 +123,9 @@ test_ats() {
         step "creating ATS virtualenv"
         python -m venv .venv
         py=$(python_bin)
-        "$py" -m pip install -q -r requirements.txt pytest httpx
     fi
+    # Pulled commits may add dependencies; this is quick when nothing changed.
+    "$py" -m pip install -q --disable-pip-version-check -r requirements.txt pytest httpx
     "$py" -m pytest tests -q -p no:cacheprovider
 }
 
