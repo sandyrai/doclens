@@ -29,3 +29,35 @@ jobs:
         run: uv sync --locked
       - name: Run tests
         run: uv run pytest tests -q
+
+  deploy:
+    needs: pytest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          if [ -z "$VPS_HOST" ] || [ -z "$VPS_SSH_KEY" ] || [ -z "$VPS_KNOWN_HOSTS" ]; then
+            echo "::notice::Deploy skipped: set the VPS_HOST, VPS_SSH_KEY and VPS_KNOWN_HOSTS secrets to enable it."
+            exit 0
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # The key's forced command on the VPS runs deploy/vps/deploy.sh,
+          # which builds, health-checks and rolls back on failure.
+          git archive HEAD | ssh -i ~/.ssh/deploy_key \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "ojdeploy@$VPS_HOST" "deploy doclens $GITHUB_SHA"
+      - name: Remove deploy key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

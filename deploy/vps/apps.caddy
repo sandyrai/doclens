@@ -1,0 +1,41 @@
+
+# ---- OjasYukti AI apps (containers in ~ojdeploy/ojasyukti-apps) ----
+doclens.ojasyukti.tech {
+	encode zstd gzip
+
+	request_body {
+		max_size 25MB
+	}
+
+	reverse_proxy 127.0.0.1:8300 {
+		transport http {
+			read_timeout 300s
+		}
+	}
+
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "SAMEORIGIN"
+	}
+}
+
+resume.ojasyukti.tech {
+	encode zstd gzip
+
+	request_body {
+		max_size 12MB
+	}
+
+	reverse_proxy 127.0.0.1:8100 {
+		transport http {
+			read_timeout 300s
+		}
+	}
+
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "SAMEORIGIN"
+	}
+}

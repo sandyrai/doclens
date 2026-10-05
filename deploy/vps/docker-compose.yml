@@ -1,0 +1,78 @@
+# OjasYukti AI apps: DocLens + ATS Tailor sharing one local Ollama.
+# Lives at ~/ojasyukti-apps on the VPS. Caddy proxies:
+#   doclens.ojasyukti.tech -> 127.0.0.1:8300
+#   resume.ojasyukti.tech  -> 127.0.0.1:8100
+name: ojasyukti-apps
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ojas-ollama
+    restart: unless-stopped
+    environment:
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "2"
+      OLLAMA_KEEP_ALIVE: "15m"
+    volumes:
+      - ollama:/root/.ollama
+    mem_limit: 4g
+    cpus: 1.6           # leave headroom for n8n / Postgres / other apps
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  doclens-db:
+    image: pgvector/pgvector:pg17
+    container_name: doclens-db
+    restart: unless-stopped
+    env_file: ./db.env
+    volumes:
+      - doclens-pg:/var/lib/postgresql/data
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U doclens -d doclens"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  doclens:
+    build: ./doclens
+    image: doclens:local
+    container_name: doclens
+    restart: unless-stopped
+    env_file: ./doclens.env
+    depends_on:
+      ollama:
+        condition: service_started
+      doclens-db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8300:8000"
+    volumes:
+      - doclens-uploads:/srv/uploads
+      - doclens-ocr:/srv/ocr_cache
+      - doclens-data:/srv/data
+    mem_limit: 1536m
+
+  ats:
+    build: ./ats-tailor
+    image: ats-tailor:local
+    container_name: ats-tailor
+    restart: unless-stopped
+    env_file: ./ats.env
+    depends_on: [ollama]
+    ports:
+      - "127.0.0.1:8100:8100"
+    volumes:
+      - ats-data:/srv/data
+    mem_limit: 1g
+
+volumes:
+  ollama:
+  doclens-uploads:
+  doclens-pg:
+  doclens-ocr:
+  doclens-data:
+  ats-data:
