@@ -27,13 +27,13 @@ from fastapi import APIRouter
 from fastapi.responses import FileResponse, JSONResponse
 
 from ai_document_agent.pdf_processor import (
-    IMAGES_DIR,
     delete_document,
     list_document_images,
     list_documents,
 )
 from ai_document_agent.query_cache import invalidate_cache
 from ai_document_agent.shared import make_request_id
+from ai_document_agent.tenancy import visitor_images_dir
 
 router = APIRouter(tags=["documents"])
 
@@ -180,13 +180,20 @@ def get_document_image(
     # Sanitize filename to prevent path traversal attacks
     safe_name = Path(filename).name
 
-    if safe_name != filename or ".." in filename:
+    # document_id is a hex content hash. Rejecting anything
+    # else also blocks "..", which would otherwise step out
+    # of the images folder into the raw uploads.
+    if (
+        safe_name != filename
+        or ".." in filename
+        or not document_id.isalnum()
+    ):
         return JSONResponse(
             status_code=400,
             content={"error": "Invalid filename."},
         )
 
-    img_path = IMAGES_DIR / document_id / safe_name
+    img_path = visitor_images_dir() / document_id / safe_name
 
     if not img_path.exists() or not img_path.is_file():
         return JSONResponse(

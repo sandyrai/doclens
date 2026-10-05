@@ -31,8 +31,8 @@ It runs fully locally (Ollama, LM Studio) or with any cloud LLM: OpenRouter, Goo
 - Ingests **PDF, DOCX, TXT, CSV and images**. PyMuPDF for native text, with **Tesseract OCR** fallback for scanned pages (OCR results are cached).
 - **Table extraction** from PDFs into CSV, so tables can be queried exactly rather than guessed from text. Three detection strategies run on each PDF; tables with drawn grid lines are preferred, and the rest are compared after cleaning.
 - Overlapping chunks (500 characters, 100 overlap) with source and page metadata.
-- Embeddings with `nomic-embed-text` (768 dimensions, via local Ollama) stored in **ChromaDB**, a persistent vector database.
-- **Hybrid search:** semantic vector search and **BM25** keyword search, merged with **Reciprocal Rank Fusion**. Semantic search matches meaning ("income" ↔ "revenue"); BM25 catches exact terms like names, IDs and clause numbers.
+- Embeddings with `nomic-embed-text` (768 dimensions, via local Ollama) stored in **PostgreSQL + pgvector**.
+- **Hybrid search:** semantic vector search and Postgres **full-text** keyword search, merged with **Reciprocal Rank Fusion**. Semantic search matches meaning ("income" ↔ "revenue"); keyword search catches exact terms like names, IDs and clause numbers.
 - Grounded prompts: the model answers from retrieved excerpts, cites source and page, and says when the answer isn't in the document.
 - Follow-up questions are rewritten with conversation context ("what about last year?"), and page-specific questions ("summarize page 4") are detected.
 
@@ -65,8 +65,8 @@ flowchart LR
     end
     R --> AG[Agent: prompt building, tool calling, streaming]
     R --> ING[Ingestion: extract, OCR, tables, chunk, embed]
-    ING --> VDB[(ChromaDB vectors)]
-    ING --> BM[BM25 index]
+    ING --> VDB[(pgvector chunks)]
+    ING --> BM[Full-text index]
     AG --> HS[Hybrid search + RRF]
     HS --> VDB
     HS --> BM
@@ -81,7 +81,7 @@ flowchart LR
 
 1. The question is checked against the semantic cache. On a hit, the cached answer is returned immediately.
 2. Follow-up questions are enriched with earlier conversation context.
-3. Hybrid search retrieves the best chunks: vector and BM25 results are fused with RRF.
+3. Hybrid search retrieves the best chunks: vector and full-text results are fused with RRF.
 4. The prompt is built from the excerpts, conversation history and grounding rules.
 5. If the question needs exact numbers from a table, the LLM calls the data tools and receives computed results.
 6. The answer streams back token by token and is saved to the session.
@@ -90,7 +90,7 @@ flowchart LR
 
 ## Quick start
 
-Requirements: Python 3.12, [uv](https://docs.astral.sh/uv/), [Ollama](https://ollama.com) (for embeddings), and optionally [Tesseract](https://github.com/tesseract-ocr/tesseract) for scanned documents.
+Requirements: Python 3.12, [uv](https://docs.astral.sh/uv/), [Ollama](https://ollama.com) (for embeddings), PostgreSQL with [pgvector](https://github.com/pgvector/pgvector) (Docker is easiest), and optionally [Tesseract](https://github.com/tesseract-ocr/tesseract) for scanned documents.
 
 ```bash
 git clone https://github.com/sandyrai/ai-document-agent.git
@@ -99,7 +99,10 @@ cp .env.example .env          # Windows: copy .env.example .env
 uv sync
 
 ollama pull nomic-embed-text  # embeddings, used whichever LLM you choose
+docker compose up -d db       # PostgreSQL + pgvector on 127.0.0.1:5432
 ```
+
+The default `DATABASE_URL` in `.env.example` matches that container.
 
 Choose an LLM (next section), test it, then start the server:
 
@@ -206,21 +209,25 @@ The key travels as a query parameter because browser WebSocket clients can't set
 
 | Decision | Why |
 |---|---|
-| Hybrid search (BM25 + vectors, RRF) | Embeddings miss exact tokens such as names, invoice numbers and clause IDs; BM25 misses paraphrases. RRF merges the two rankings without tuning score scales. |
+| Hybrid search (full-text + vectors, RRF) | Embeddings miss exact tokens such as names, invoice numbers and clause IDs; keyword search misses paraphrases. RRF merges the two rankings without tuning score scales. |
 | Tool calling for tables | LLMs are unreliable at arithmetic over many rows. Computing in code and giving the model the result makes numeric answers exact. |
 | Local embeddings via Ollama | No per-request cost, and document text never leaves the machine for indexing. |
 | SHA-256 for API keys | Keys are 256-bit random values, so a fast hash is safe; bcrypt's slowness only helps low-entropy passwords. |
-| SQLite with raw SQL | Zero-config persistence for a single server, and every query is visible. |
+| PostgreSQL + pgvector for chunks | One table with a `visitor_id` column makes per-visitor isolation a single WHERE clause; full-text search is indexed and persistent; works with several app workers and normal backups. Vector search is an exact scan of the visitor's own rows, because an approximate index ranks across all visitors before filtering. |
+| SQLite with raw SQL for sessions | Zero-config persistence for chat history, and every query is visible. |
 | Model fallback chain | Free and hosted models get rate-limited or removed; the app keeps answering instead of failing. |
 
-**Current limits:** single-server design (SQLite and an in-process BM25 index); the web UI is anonymous and protected by per-IP limits rather than user accounts; CORS is open for local use. Next steps: user authentication, PostgreSQL + pgvector for multi-instance deployment, a cross-encoder re-ranker, and a retrieval evaluation set.
+**Public deployments:** set `VISITOR_ISOLATION=true`. Each browser then gets an anonymous visitor cookie, and its documents, chat sessions and cached answers are private to it (WebSocket apps are isolated per API key). Visitor documents are deleted after `VISITOR_RETENTION_DAYS` (default 7).
+
+**Current limits:** chat history is still SQLite (single server); visitors are anonymous, so clearing cookies loses access to your documents; CORS is open for local use. Next steps: user accounts, a cross-encoder re-ranker, and a retrieval evaluation set.
 
 ---
 
 ## Security
 
 - Keys live only in `.env`, which is git-ignored; `.env.example` has placeholders.
-- Uploads, the vector DB (`chroma_db/`), chat history (`data/`) and the OCR cache are git-ignored.
+- Uploads, chat history (`data/`) and the OCR cache are git-ignored; document chunks live in Postgres.
+- With `VISITOR_ISOLATION=true`, visitors can only list, search, read or delete their own documents and sessions.
 - Uploaded filenames are sanitized against path traversal.
 - `X-Forwarded-For` is trusted only when `TRUST_PROXY_HEADERS=true`, so clients can't bypass rate limits by faking an IP.
 

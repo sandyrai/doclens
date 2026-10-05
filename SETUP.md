@@ -66,6 +66,23 @@ You should see both `qwen3:8b` and `nomic-embed-text` in the list.
 
 ---
 
+### 5. PostgreSQL + pgvector (document store)
+
+Uploaded documents are chunked, embedded and stored in PostgreSQL with the
+[pgvector](https://github.com/pgvector/pgvector) extension. The easiest way to
+run it locally is the bundled Docker Compose file (needs Docker Desktop):
+
+```bash
+docker compose up -d db
+```
+
+This starts `pgvector/pgvector:pg17` on `127.0.0.1:5432` with user, password and
+database all set to `doclens`, which matches `DATABASE_URL` in `.env.example`.
+DocLens creates its table and indexes on first use. To use your own Postgres
+instead, run `CREATE EXTENSION vector;` in it and point `DATABASE_URL` at it.
+
+---
+
 ## Choosing your LLM (local or cloud)
 
 The app works with local Ollama by default. To use another LLM (LM Studio,
@@ -228,7 +245,7 @@ uv add <package-name>
 
 Example:
 ```
-uv add chromadb
+uv add httpx
 ```
 
 This updates `pyproject.toml` and `uv.lock` automatically.
@@ -262,7 +279,7 @@ ai-document-agent/
 └── README.md, SETUP.md
 ```
 
-Created at runtime (git-ignored): `uploads/`, `chroma_db/`, `ocr_cache/`, `data/`.
+Created at runtime (git-ignored): `uploads/`, `ocr_cache/`, `data/`. Document chunks are stored in PostgreSQL (`docker compose up -d db`).
 
 ---
 

@@ -90,6 +90,7 @@ from ai_document_agent.pdf_processor import (
 #   space as the document embeddings, making cosine
 #   similarity comparisons meaningful.
 
+from ai_document_agent.tenancy import visitor_upload_dir
 from ai_document_agent.query_cache import (
     lookup_cache,
     store_in_cache,
@@ -129,8 +130,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------
 # Upload directory — needed to find CSV files for analysis
 # ---------------------------------------------------------
-
-UPLOAD_DIR = Path(__file__).resolve().parents[2] / "uploads"
+#
+# Each visitor has their own upload folder (tenancy.py), so
+# this is a function call rather than a constant: filename
+# lookups must only ever see the current visitor's files.
 
 
 # ---------------------------------------------------------
@@ -1376,8 +1379,7 @@ def _resolve_source_filter(
         return source_filter
 
     # No uploads directory — nothing to resolve
-    if not UPLOAD_DIR.exists():
-        return None
+    upload_dir = visitor_upload_dir()
 
     # -------------------------------------------------
     # Scan the uploads directory for original filenames.
@@ -1397,7 +1399,7 @@ def _resolve_source_filter(
 
     original_names: list[str] = []
 
-    for path in UPLOAD_DIR.iterdir():
+    for path in upload_dir.iterdir():
         if not path.is_file():
             continue
 
@@ -1559,7 +1561,7 @@ def _get_tools_for_source(
         ".pdf"
     ):
         csv_path = find_extracted_table_csv(
-            source_filter, UPLOAD_DIR,
+            source_filter, visitor_upload_dir(),
         )
         if csv_path:
             try:
@@ -2201,12 +2203,12 @@ def _find_csv_for_source(
 
     # Direct CSV file
     if is_tabular_file(source):
-        return find_upload_path(source, UPLOAD_DIR)
+        return find_upload_path(source, visitor_upload_dir())
 
     # PDF with extracted table
     if source.lower().endswith(".pdf"):
         return find_extracted_table_csv(
-            source, UPLOAD_DIR,
+            source, visitor_upload_dir(),
         )
 
     return None

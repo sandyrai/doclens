@@ -42,9 +42,9 @@ from pathlib import Path
 
 import fitz  # PyMuPDF — the import name is "fitz"
 from ollama import embed
-from rank_bm25 import BM25Okapi
 
-import chromadb
+from ai_document_agent import vector_store
+from ai_document_agent.tenancy import visitor_images_dir, visitor_upload_dir
 
 
 logger = logging.getLogger(__name__)
@@ -269,212 +269,14 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 
 
 # ---------------------------------------------------------
-# ChromaDB setup
+# Vector store
 # ---------------------------------------------------------
 #
-# What is ChromaDB?
-#   A vector database — it stores text + vectors and lets
-#   you search by similarity. Think of it like a database
-#   where instead of "SELECT WHERE name = 'Alice'", you
-#   say "find the 5 things most similar to this question."
-#
-# PersistentClient:
-#   Saves data to disk so it survives server restarts.
-#   Without this, uploaded PDFs would disappear every
-#   time you restart the server.
-#
-# Collection:
-#   Like a table in SQL. We use one collection called
-#   "documents" for all uploaded PDFs. Each chunk is a
-#   "document" in ChromaDB terms (confusing naming, but
-#   that's what they call individual records).
-
-CHROMA_PATH = Path(__file__).resolve().parents[2] / "chroma_db"
-
-chroma_client = chromadb.PersistentClient(
-    path=str(CHROMA_PATH)
-)
-
-collection = chroma_client.get_or_create_collection(
-    name="documents",
-    metadata={
-        "hnsw:space": "cosine",
-    },
-)
-
-
-# ---------------------------------------------------------
-# BM25 Keyword Index
-# ---------------------------------------------------------
-#
-# Why BM25 alongside semantic search?
-#
-#   Semantic search (embeddings) finds text with similar
-#   MEANING — great for "what were the key findings?"
-#   But it can miss exact keyword matches. If you search
-#   for "Rahul Kumar" or "Invoice #4521", semantic search
-#   might rank a vague paraphrase higher than the chunk
-#   with the exact term.
-#
-#   BM25 is a classic keyword algorithm that scores chunks
-#   by how often query words appear (term frequency) and
-#   how rare those words are across all chunks (inverse
-#   document frequency). It excels at exact matches.
-#
-#   By running BOTH and merging with Reciprocal Rank Fusion,
-#   we get the best of both: meaning + keywords.
-#
-# Why in-memory?
-#   For a learning project with a few PDFs, the entire
-#   corpus fits easily in RAM. We rebuild from ChromaDB
-#   on startup — ChromaDB is the durable store.
-
-class BM25Index:
-    """In-memory BM25 keyword index built from ChromaDB."""
-
-    def __init__(self):
-        self._corpus_texts: list[str] = []
-        self._corpus_metadata: list[dict] = []
-        self._bm25: BM25Okapi | None = None
-        self._source_indices: dict[str, list[int]] = {}
-
-    def _tokenize(self, text: str) -> list[str]:
-        """Simple word tokenizer.
-
-        Lowercase + split on non-word characters + drop
-        short tokens. No NLTK needed — this covers 95%
-        of cases for document search.
-        """
-        return [
-            t for t in re.split(r"\W+", text.lower())
-            if len(t) >= 2
-        ]
-
-    def rebuild(self, coll) -> None:
-        """Rebuild the full index from ChromaDB.
-
-        Called on startup and after any add/delete.
-        For a small corpus this takes milliseconds.
-        """
-
-        if coll.count() == 0:
-            self._corpus_texts = []
-            self._corpus_metadata = []
-            self._bm25 = None
-            self._source_indices = {}
-            logger.info("BM25 index: empty (no documents)")
-            return
-
-        # Fetch everything from ChromaDB
-        all_data = coll.get(
-            include=["documents", "metadatas"],
-        )
-
-        self._corpus_texts = all_data["documents"]
-        self._corpus_metadata = all_data["metadatas"]
-
-        # Tokenize each chunk for BM25
-        tokenized = [
-            self._tokenize(text)
-            for text in self._corpus_texts
-        ]
-
-        self._bm25 = BM25Okapi(tokenized)
-
-        # Build source → indices lookup for filtering
-        self._source_indices = {}
-        for i, meta in enumerate(self._corpus_metadata):
-            source = meta.get("source", "unknown")
-            if source not in self._source_indices:
-                self._source_indices[source] = []
-            self._source_indices[source].append(i)
-
-        logger.info(
-            "BM25 index rebuilt: %d chunks, %d sources",
-            len(self._corpus_texts),
-            len(self._source_indices),
-        )
-
-    def search(
-        self,
-        query: str,
-        n_results: int = 5,
-        source_filter: str | None = None,
-    ) -> list[dict]:
-        """Search the BM25 index.
-
-        Returns results in the same dict format as
-        semantic search for easy merging.
-        """
-
-        if self._bm25 is None:
-            return []
-
-        tokenized_query = self._tokenize(query)
-
-        if not tokenized_query:
-            return []
-
-        # If source_filter is set, build a temporary
-        # BM25 index over just that source's chunks.
-        # This keeps keyword results scoped correctly.
-        if source_filter and source_filter in self._source_indices:
-            indices = self._source_indices[source_filter]
-            filtered_texts = [
-                self._corpus_texts[i] for i in indices
-            ]
-            filtered_meta = [
-                self._corpus_metadata[i] for i in indices
-            ]
-            filtered_tokenized = [
-                self._tokenize(t) for t in filtered_texts
-            ]
-
-            if not filtered_tokenized:
-                return []
-
-            temp_bm25 = BM25Okapi(filtered_tokenized)
-            scores = temp_bm25.get_scores(tokenized_query)
-
-            # Pair scores with their data
-            scored = list(zip(
-                scores, filtered_texts, filtered_meta
-            ))
-
-        elif source_filter:
-            # Source not found in index
-            return []
-
-        else:
-            # Search full corpus
-            scores = self._bm25.get_scores(tokenized_query)
-            scored = list(zip(
-                scores,
-                self._corpus_texts,
-                self._corpus_metadata,
-            ))
-
-        # Sort by score descending and take top N
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top = scored[:n_results]
-
-        results = []
-        for score, text, meta in top:
-            if score > 0:  # skip zero-score chunks
-                results.append({
-                    "text": text,
-                    "source": meta.get("source", "unknown"),
-                    "page": meta.get("page", 0),
-                    "bm25_score": round(score, 4),
-                })
-
-        return results
-
-
-# Create the global BM25 index and build it from
-# whatever is already in ChromaDB (cold start).
-bm25_index = BM25Index()
-bm25_index.rebuild(collection)
+# Chunks, embeddings and the keyword (full-text) index live
+# in PostgreSQL + pgvector — see vector_store.py. Every read
+# and write there is scoped to the current visitor
+# (tenancy.py), so the functions below never see another
+# visitor's documents.
 
 
 # ---------------------------------------------------------
@@ -2572,19 +2374,11 @@ def store_chunks(
     embeddings: list[list[float]],
     document_id: str,
 ) -> int:
-    """Store chunks + embeddings in ChromaDB.
+    """Store chunks + embeddings in the vector store.
 
-    How ChromaDB stores data:
-      Each record has:
-        - id: Unique string identifier
-        - document: The text content
-        - embedding: The vector (list of floats)
-        - metadata: Any extra info (source, page, etc.)
-
-    We generate deterministic IDs using a hash of the
-    document_id + chunk_index. This means:
-      - Re-uploading the same PDF won't create duplicates.
-      - Each chunk has a predictable, unique ID.
+    Replaces any chunks this visitor already has for the
+    same document_id, so re-uploading the same file never
+    creates duplicates.
 
     Args:
         chunks: Output from chunk_pages().
@@ -2595,52 +2389,17 @@ def store_chunks(
         Number of chunks stored.
     """
 
-    ids = []
-    documents = []
-    metadatas = []
-
-    for i, chunk in enumerate(chunks):
-
-        # Deterministic ID: hash of document + chunk index
-        chunk_id = hashlib.md5(
-            f"{document_id}_{i}".encode()
-        ).hexdigest()
-
-        ids.append(chunk_id)
-        documents.append(chunk["text"])
-
-        # ChromaDB metadata values must be str, int,
-        # float, or bool — no nested objects.
-        metadata = {
-            "source": chunk["metadata"]["source"],
-            "page": chunk["metadata"]["page"],
-            "chunk_index": chunk["metadata"]["chunk_index"],
-            "document_id": document_id,
-        }
-
-        metadatas.append(metadata)
-
-    # upsert = insert or update. If the chunk already
-    # exists (same ID), it gets replaced instead of
-    # creating a duplicate.
-
-    collection.upsert(
-        ids=ids,
-        documents=documents,
-        embeddings=embeddings,
-        metadatas=metadatas,
+    stored = vector_store.store_chunks(
+        chunks, embeddings, document_id,
     )
 
     logger.info(
         "Stored %d chunks for document '%s'",
-        len(ids),
+        stored,
         document_id,
     )
 
-    # Rebuild BM25 index to include the new chunks
-    bm25_index.rebuild(collection)
-
-    return len(ids)
+    return stored
 
 
 # ---------------------------------------------------------
@@ -2652,12 +2411,12 @@ def _semantic_search(
     n_results: int = 5,
     source_filter: str | None = None,
 ) -> list[dict]:
-    """Semantic search using ChromaDB embeddings.
+    """Semantic search over the visitor's chunk embeddings.
 
     How it works:
       1. Convert the query into an embedding vector.
-      2. Ask ChromaDB to find the N stored vectors that
-         are closest (most similar) to the query vector.
+      2. Find the N stored vectors closest to it by cosine
+         distance (vector_store.semantic_search).
       3. Return those chunks with their metadata.
 
     "Cosine similarity" measures the angle between two
@@ -2667,36 +2426,11 @@ def _semantic_search(
     meaning) have low similarity (~0.0).
     """
 
-    if collection.count() == 0:
-        return []
-
     query_embedding = generate_embeddings([query])[0]
 
-    where_filter = None
-    if source_filter:
-        where_filter = {"source": source_filter}
-
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(n_results, collection.count()),
-        where=where_filter,
+    return vector_store.semantic_search(
+        query_embedding, n_results, source_filter,
     )
-
-    search_results = []
-
-    for i in range(len(results["ids"][0])):
-        search_results.append({
-            "text": results["documents"][0][i],
-            "source": results["metadatas"][0][i].get(
-                "source", "unknown"
-            ),
-            "page": results["metadatas"][0][i].get(
-                "page", 0
-            ),
-            "distance": results["distances"][0][i],
-        })
-
-    return search_results
 
 
 # ---------------------------------------------------------
@@ -2789,19 +2523,18 @@ def get_page_chunks(
       semantic search fails because page numbers have no semantic
       meaning — page 4 content could be about anything.
 
-      Instead of searching by meaning, we go directly to ChromaDB's
+      Instead of searching by meaning, we go directly to the stored
       metadata and fetch ALL chunks tagged with page=4. This
       guarantees we get the right page's content every time.
 
     HOW IT WORKS:
 
-      ChromaDB stores metadata for each chunk:
+      The vector store keeps metadata for each chunk:
         {"source": "report.pdf", "page": 4, "chunk_index": 7, ...}
 
-      We use ChromaDB's `where` filter to fetch chunks where
-      page == page_num. If source_filter is also provided, we
-      combine both filters with $and so we only get chunks
-      from that specific document + page.
+      We fetch chunks where page == page_num, and also
+      filter by source when source_filter is provided, so we
+      only get chunks from that specific document + page.
 
     Args:
         page_num: The page number to fetch (1-based, matching
@@ -2813,41 +2546,15 @@ def get_page_chunks(
         that page, sorted by chunk_index (reading order).
     """
 
-    if collection.count() == 0:
-        return []
-
-    # Build a metadata filter for ChromaDB.
-    #
-    # ChromaDB's `where` clause supports:
-    #   {"page": 4}                    — single condition
-    #   {"$and": [{"page": 4}, ...]}   — multiple conditions
-    #
-    # We always filter by page number. If the user selected
-    # a specific document (source_filter), we add that too
-    # so we don't accidentally return page 4 from a DIFFERENT
-    # uploaded document.
-    if source_filter:
-        where_filter = {
-            "$and": [
-                {"page": page_num},
-                {"source": source_filter},
-            ]
-        }
-    else:
-        where_filter = {"page": page_num}
-
     try:
-        results = collection.get(
-            where=where_filter,
-            include=["documents", "metadatas"],
-        )
+        rows = vector_store.page_chunks(page_num, source_filter)
     except Exception as exc:
         logger.warning(
             "Page-specific query failed: %s", exc,
         )
         return []
 
-    if not results["documents"]:
+    if not rows:
         logger.info(
             "No chunks found for page %d (filter=%s)",
             page_num,
@@ -2855,26 +2562,16 @@ def get_page_chunks(
         )
         return []
 
-    # Build Evidence objects from the results.
-    # Sort by chunk_index so the text appears in
-    # reading order (top of page → bottom of page).
-    evidence = []
-
-    for i in range(len(results["documents"])):
-        evidence.append(
-            Evidence(
-                text=results["documents"][i],
-                source=results["metadatas"][i].get(
-                    "source", "unknown",
-                ),
-                page=results["metadatas"][i].get(
-                    "page", 0,
-                ),
-                score=1.0,  # direct fetch = perfect match
-            )
+    evidence = [
+        Evidence(
+            text=row["text"],
+            source=row["source"],
+            page=row["page"],
+            score=1.0,  # direct fetch = perfect match
         )
+        for row in rows
+    ]
 
-    # Sort by chunk_index for reading order
     evidence.sort(
         key=lambda e: e.page,
     )
@@ -2895,7 +2592,7 @@ def search_documents(
     n_results: int = 5,
     source_filter: str | None = None,
 ) -> list[Evidence]:
-    """Hybrid search: semantic + BM25, merged with RRF.
+    """Hybrid search: semantic + full-text, merged with RRF.
 
     Runs BOTH retrievers and merges with Reciprocal Rank
     Fusion. This gives the best of both worlds:
@@ -2922,8 +2619,8 @@ def search_documents(
         source_filter or "all",
     )
 
-    if collection.count() == 0:
-        logger.info("No documents in collection")
+    if vector_store.count_chunks() == 0:
+        logger.info("No documents for this visitor")
         return []
 
     # Fetch more candidates than needed from each
@@ -2937,12 +2634,12 @@ def search_documents(
     )
 
     # 2. BM25 keyword search
-    bm25_results = bm25_index.search(
+    bm25_results = vector_store.keyword_search(
         query, fetch_count, source_filter
     )
 
     logger.info(
-        "Semantic: %d results, BM25: %d results",
+        "Semantic: %d results, keyword: %d results",
         len(semantic_results),
         len(bm25_results),
     )
@@ -3033,7 +2730,8 @@ IMAGE_MIN_BYTES = 5 * 1024       # 5 KB — skip tiny icons
 IMAGE_MAX_BYTES = 2 * 1024 * 1024  # 2 MB — cap large images
 
 # Where extracted images are stored
-IMAGES_DIR = Path(__file__).resolve().parents[2] / "uploads" / "images"
+# Images live under the visitor's upload folder; see
+# tenancy.visitor_images_dir().
 
 
 def extract_images_from_pdf(
@@ -3079,7 +2777,7 @@ def extract_images_from_pdf(
     # Create output directory for this document's images.
     # Each document gets its own subdirectory to keep
     # things organized and make cleanup easy.
-    img_dir = IMAGES_DIR / document_id
+    img_dir = visitor_images_dir() / document_id
     img_dir.mkdir(parents=True, exist_ok=True)
 
     # Track which image xrefs we've already saved.
@@ -3253,7 +2951,7 @@ def list_document_images(
         Empty list if no images directory exists.
     """
 
-    img_dir = IMAGES_DIR / document_id
+    img_dir = visitor_images_dir() / document_id
 
     if not img_dir.exists():
         return []
@@ -3304,7 +3002,7 @@ def delete_document_images(
         directory existed.
     """
 
-    img_dir = IMAGES_DIR / document_id
+    img_dir = visitor_images_dir() / document_id
 
     if not img_dir.exists():
         return False
@@ -3553,37 +3251,17 @@ def get_document_chunk_count(
 
     Args:
         source: Filename to count chunks for (e.g. "report.pdf").
-                If None, returns total chunks across ALL documents.
+                If None, returns total chunks across ALL of the
+                visitor's documents.
 
     Returns:
-        Number of chunks in ChromaDB for the given document.
-        Returns 0 if the document doesn't exist or collection
-        is empty.
+        Number of stored chunks for the given document.
+        Returns 0 if the document doesn't exist or the
+        store is unreachable.
     """
 
-    # If no source specified, return total count
-    # (useful for "how many chunks total?" diagnostics)
-    if source is None:
-        return collection.count()
-
-    # -------------------------------------------------
-    # WHY collection.get() WITH where FILTER?
-    #
-    #   ChromaDB doesn't have a direct "count where" API.
-    #   But collection.get() with a where filter returns
-    #   only matching document IDs. We don't request
-    #   embeddings or documents (text), so the response
-    #   is tiny — just a list of ID strings.
-    #
-    #   len(result["ids"]) gives us the exact chunk count
-    #   for this specific file.
-    # -------------------------------------------------
     try:
-        result = collection.get(
-            where={"source": source},
-            include=[],  # No embeddings, no text — just IDs
-        )
-        return len(result["ids"])
+        return vector_store.count_chunks(source)
     except Exception as exc:
         logger.warning(
             "Failed to count chunks for '%s': %s",
@@ -3593,98 +3271,55 @@ def get_document_chunk_count(
 
 
 def list_documents() -> list[dict]:
-    """List all uploaded documents.
+    """List the current visitor's uploaded documents.
 
-    Returns a summary of each unique document in the
-    vector store.
+    Returns a summary of each document: document_id,
+    filename, chunk count and page count.
     """
 
-    if collection.count() == 0:
-        return []
-
-    # Get all metadata to find unique documents
-    all_data = collection.get(
-        include=["metadatas"],
-    )
-
-    # Group by document_id
-    docs = {}
-
-    for metadata in all_data["metadatas"]:
-
-        doc_id = metadata.get("document_id", "unknown")
-
-        if doc_id not in docs:
-            docs[doc_id] = {
-                "document_id": doc_id,
-                "filename": metadata.get(
-                    "source", "unknown"
-                ),
-                "chunks": 0,
-                "pages": set(),
-            }
-
-        docs[doc_id]["chunks"] += 1
-        docs[doc_id]["pages"].add(
-            metadata.get("page", 0)
-        )
-
-    # Convert sets to counts
-    result = []
-
-    for doc in docs.values():
-        result.append(
-            {
-                "document_id": doc["document_id"],
-                "filename": doc["filename"],
-                "chunks": doc["chunks"],
-                "pages": len(doc["pages"]),
-            }
-        )
-
-    return result
+    return vector_store.list_documents()
 
 
 def delete_document(document_id: str) -> bool:
-    """Delete all chunks AND extracted images for a document.
+    """Delete a document: chunks, extracted images and files.
 
-    Phase 8 addition: also deletes the images directory
-    for this document, so no orphaned image files remain
-    on disk after document deletion.
+    Removes the uploaded file and its extracted table CSV
+    too, so nothing of a deleted document stays on disk
+    (and the table tools can no longer find it).
 
     Args:
         document_id: The document to delete.
 
     Returns:
-        True if chunks were deleted, False if none found.
+        True if the visitor had this document, False if
+        not (including when it belongs to another visitor).
     """
 
     try:
-        collection.delete(
-            where={"document_id": document_id},
-        )
-
-        # Rebuild BM25 index without the deleted chunks
-        bm25_index.rebuild(collection)
-
-        # Phase 8: Clean up extracted images from disk.
-        # Even if there are no images, this is a no-op
-        # (returns False), so it's safe to call always.
-        delete_document_images(document_id)
-
-        logger.info(
-            "Deleted document: %s",
-            document_id,
-        )
-
-        return True
-
+        removed = vector_store.delete_document(document_id)
     except Exception as exc:
-
         logger.error(
             "Failed to delete document %s: %s",
             document_id,
             exc,
         )
-
         return False
+
+    if not removed:
+        return False
+
+    delete_document_images(document_id)
+
+    for path in visitor_upload_dir().glob(f"{document_id}_*"):
+        if path.is_file():
+            path.unlink(missing_ok=True)
+
+    logger.info(
+        "Deleted document: %s (%d chunks)",
+        document_id,
+        removed,
+    )
+
+    return True
+
+

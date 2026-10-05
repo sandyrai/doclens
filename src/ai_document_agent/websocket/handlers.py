@@ -87,11 +87,16 @@ from ai_document_agent.query_cache import invalidate_cache
 from ai_document_agent.shared import (
     MAX_MESSAGES_PER_SESSION,
     MAX_UPLOAD_BYTES,
-    UPLOAD_DIR,
     document_suggestions,
     make_request_id,
     sanitize_filename,
     upload_tasks,
+)
+from ai_document_agent.tenancy import (
+    document_hash_salt,
+    run_with_context,
+    scoped_key,
+    visitor_upload_dir,
 )
 from ai_document_agent.websocket.protocol import (
     ErrorCode,
@@ -101,6 +106,17 @@ from ai_document_agent.websocket.protocol import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _run_in_executor(executor, fn):
+    """loop.run_in_executor() that keeps the visitor context.
+
+    Executor threads don't inherit ContextVars, so without
+    this the worker would read and write the default
+    visitor's documents instead of this connection's.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(executor, run_with_context(fn))
 
 
 # ---------------------------------------------------------
@@ -326,7 +342,7 @@ async def handle_document_upload(
     try:
         # Generate document ID from content hash
         document_id = hashlib.sha256(
-            file_bytes
+            document_hash_salt() + file_bytes
         ).hexdigest()[:12]
 
         # Check for duplicate
@@ -349,7 +365,7 @@ async def handle_document_upload(
                 return
 
         # Save file to disk
-        save_path = UPLOAD_DIR / f"{document_id}_{safe_filename}"
+        save_path = visitor_upload_dir() / f"{document_id}_{safe_filename}"
 
         with open(save_path, "wb") as f:
             f.write(file_bytes)
@@ -385,7 +401,7 @@ async def handle_document_upload(
 
         # Run blocking process_document in a thread pool
         # so we don't block the async event loop
-        result = await asyncio.get_event_loop().run_in_executor(
+        result = await _run_in_executor(
             None,
             lambda: process_document(
                 file_path=str(save_path),
@@ -424,7 +440,7 @@ async def handle_document_upload(
                     document_text=doc_text,
                     filename=safe_filename,
                 )
-                document_suggestions[safe_filename] = suggestions
+                document_suggestions[scoped_key(safe_filename)] = suggestions
         except Exception as e:
             logger.warning(
                 "[%s] WS suggestion generation failed: %s",
@@ -579,7 +595,7 @@ async def handle_search(
         # be serialized to JSON for the WebSocket response.
         #
         # Evidence has: text, source, page, score
-        evidence_list = await asyncio.get_event_loop().run_in_executor(
+        evidence_list = await _run_in_executor(
             None,
             lambda: search_documents(
                 query=query,
@@ -749,7 +765,7 @@ async def handle_chat(
                     source_filter=source_filter,
                 ))
 
-            events = await asyncio.get_event_loop().run_in_executor(
+            events = await _run_in_executor(
                 None, _run_stream,
             )
 
@@ -835,7 +851,7 @@ async def handle_chat(
             # at once. Simpler for wrappers that don't want
             # to handle token-by-token streaming.
 
-            answer = await asyncio.get_event_loop().run_in_executor(
+            answer = await _run_in_executor(
                 None,
                 lambda: ask_agent(
                     messages,
@@ -988,7 +1004,7 @@ async def handle_suggestions(
         )
         return
 
-    suggestions_list = document_suggestions.get(source, [])
+    suggestions_list = document_suggestions.get(scoped_key(source), [])
 
     await websocket.send_json(
         make_success(msg_id, {

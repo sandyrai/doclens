@@ -120,6 +120,11 @@ CACHE_TTL_SECONDS = 86400  # 24 hours
 # Database path — reuse the same DB as chat history
 # ---------------------------------------------------------
 
+from ai_document_agent.tenancy import (
+    is_default_visitor,
+    scoped_key,
+    visitor_key_prefix,
+)
 from ai_document_agent.database import (
     DB_PATH,
     DATA_DIR,
@@ -311,6 +316,10 @@ def lookup_cache(
                  "html_content", "similarity", "cached": True}
     """
 
+    # Cache entries are per visitor: the same filename (or
+    # "all documents") means different content for each.
+    source_filter = scoped_key(source_filter)
+
     conn = _get_connection()
 
     try:
@@ -429,6 +438,8 @@ def store_in_cache(
         html_content:    None for text, full HTML string.
     """
 
+    source_filter = scoped_key(source_filter)
+
     conn = _get_connection()
 
     try:
@@ -526,7 +537,16 @@ def invalidate_cache(
             # Clear entries for a specific document
             cursor = conn.execute(
                 "DELETE FROM query_cache WHERE source_filter = ?",
-                (source_filter,),
+                (scoped_key(source_filter),),
+            )
+        elif not is_default_visitor():
+            # Only this visitor's entries — other visitors'
+            # documents didn't change.
+            prefix = visitor_key_prefix()
+            cursor = conn.execute(
+                "DELETE FROM query_cache "
+                "WHERE substr(source_filter, 1, ?) = ?",
+                (len(prefix), prefix),
             )
         else:
             # Clear ALL entries — safest approach

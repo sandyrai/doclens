@@ -14,6 +14,9 @@ from pathlib import Path
 os.environ["ANON_MAX_QUESTIONS"] = "100000"
 os.environ["ANON_MAX_UPLOADS"] = "100000"
 os.environ.setdefault("TRUST_PROXY_HEADERS", "false")
+# Without a test Postgres, storage calls should fail fast
+# rather than wait the production 10 s connection timeout.
+os.environ.setdefault("DB_TIMEOUT", "2")
 
 _TEST_DATA_DIR = Path(tempfile.mkdtemp(prefix="doclens-tests-"))
 _TEST_DB = _TEST_DATA_DIR / "test.db"

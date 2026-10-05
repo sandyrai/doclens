@@ -1,0 +1,18 @@
+# Local development database: PostgreSQL + pgvector.
+#   docker compose up -d db
+# Matches the default DATABASE_URL in .env.example.
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: doclens
+      POSTGRES_PASSWORD: doclens
+      POSTGRES_DB: doclens
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - doclens-db:/var/lib/postgresql/data
+
+volumes:
+  doclens-db:

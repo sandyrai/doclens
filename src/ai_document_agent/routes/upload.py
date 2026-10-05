@@ -48,12 +48,20 @@ from ai_document_agent.rate_limiter import (
 )
 from ai_document_agent.shared import (
     MAX_UPLOAD_BYTES,
-    UPLOAD_DIR,
     document_suggestions,
     get_client_ip,
     sanitize_filename,
     upload_tasks,
 )
+from ai_document_agent.tenancy import (
+    VISITOR_ISOLATION,
+    current_visitor,
+    document_hash_salt,
+    purge_expired_visitor_files,
+    scoped_key,
+    visitor_upload_dir,
+)
+from ai_document_agent.vector_store import purge_expired_chunks
 
 router = APIRouter(tags=["upload"])
 
@@ -166,6 +174,19 @@ def _process_in_background(
                 cleared,
             )
 
+        # Expire other visitors' old documents. Cheap (an
+        # indexed DELETE + a folder scan) and keeps retention
+        # working without a separate scheduler.
+        if VISITOR_ISOLATION:
+            try:
+                purge_expired_chunks()
+                purge_expired_visitor_files()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[%s] Visitor purge failed: %s",
+                    request_id, exc,
+                )
+
         # Stage complete: document is ready!
         result_data = {
             "document_id": document_id,
@@ -214,7 +235,7 @@ def _process_in_background(
 
                 # Store in shared dict — suggestions.py
                 # reads from this same dict
-                document_suggestions[safe_filename] = suggestions
+                document_suggestions[scoped_key(safe_filename)] = suggestions
 
                 logger.info(
                     "[%s] Generated %d suggestions for '%s'",
@@ -365,8 +386,11 @@ def upload_pdf(
             )
 
         # SHA-256 content-based document ID
+        # Salted per visitor, so two visitors uploading the
+        # same file get separate documents (and separate
+        # image folders / table CSVs).
         document_id = hashlib.sha256(
-            file_bytes
+            document_hash_salt() + file_bytes
         ).hexdigest()[:12]
 
         # Check for duplicate
@@ -398,7 +422,7 @@ def upload_pdf(
                 }
 
         # Save file to disk
-        save_path = UPLOAD_DIR / f"{document_id}_{safe_filename}"
+        save_path = visitor_upload_dir() / f"{document_id}_{safe_filename}"
 
         with open(save_path, "wb") as f:
             f.write(file_bytes)
@@ -411,7 +435,9 @@ def upload_pdf(
         )
 
         # Create task and start background processing
-        task_id = "task_" + uuid.uuid4().hex[:12]
+        # Full 128-bit ID: the status endpoint has no other
+        # access check, so task IDs must be unguessable.
+        task_id = "task_" + uuid.uuid4().hex
 
         # Phase 5: Save to database (survives restarts)
         create_upload_task(
@@ -425,6 +451,7 @@ def upload_pdf(
         # and backward compatibility with WebSocket handlers
         upload_tasks[task_id] = {
             "task_id": task_id,
+            "visitor": current_visitor(),
             "status": "processing",
             "stage": "saving",
             "filename": safe_filename,
@@ -514,6 +541,10 @@ def get_upload_status(task_id: str):
     # -------------------------------------------------
 
     task = upload_tasks.get(task_id)
+    foreign = (
+        task is not None
+        and task.get("visitor", current_visitor()) != current_visitor()
+    )
 
     # -------------------------------------------------
     # Tier 2: Fall back to database (after restart)
@@ -522,7 +553,7 @@ def get_upload_status(task_id: str):
     if task is None:
         task = get_upload_task(task_id)
 
-    if task is None:
+    if task is None or foreign:
         return JSONResponse(
             status_code=404,
             content={

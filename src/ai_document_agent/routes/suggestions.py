@@ -32,6 +32,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from ai_document_agent.shared import document_suggestions
+from ai_document_agent.tenancy import scoped_key
 
 router = APIRouter(tags=["suggestions"])
 
@@ -61,7 +62,7 @@ def get_suggestions(source: str = ""):
             content={"suggestions": []},
         )
 
-    suggestions = document_suggestions.get(source, [])
+    suggestions = document_suggestions.get(scoped_key(source), [])
 
     logger.info(
         "Suggestions request for '%s': %d found",

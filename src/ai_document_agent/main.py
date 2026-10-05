@@ -135,7 +135,13 @@ from ai_document_agent.rate_limiter import (
 )
 
 # Import shared constants (BASE_DIR for static files)
-from ai_document_agent.shared import BASE_DIR
+from ai_document_agent.shared import BASE_DIR, TRUST_PROXY_HEADERS
+from ai_document_agent import vector_store
+from ai_document_agent.tenancy import (
+    VISITOR_ISOLATION,
+    VisitorMiddleware,
+    purge_expired_visitor_files,
+)
 
 # Import CORS setup from middleware
 from ai_document_agent.middleware.cors import setup_cors
@@ -232,6 +238,20 @@ setup_cors(app)
 
 app.add_middleware(RequestIDMiddleware)
 
+# ---------------------------------------------------------
+# Visitor isolation (VISITOR_ISOLATION=true)
+# ---------------------------------------------------------
+#
+# Ties every request to a visitor (cookie, or API key for
+# WebSocket apps) so documents, sessions and cached answers
+# are private to that visitor. See tenancy.py. A no-op when
+# isolation is off.
+
+app.add_middleware(
+    VisitorMiddleware,
+    trust_proxy_headers=TRUST_PROXY_HEADERS,
+)
+
 
 # ---------------------------------------------------------
 # Static files
@@ -287,6 +307,21 @@ cleanup_old_usage(days_to_keep=30)
 # anymore. Keeps the database tidy.
 
 cleaned = cleanup_old_upload_tasks(hours=24)
+
+# ---------------------------------------------------------
+# Expire old visitor documents
+# ---------------------------------------------------------
+#
+# Public visitors' documents are kept for
+# VISITOR_RETENTION_DAYS, then removed from the database
+# and disk. Local single-user data is never purged.
+
+if VISITOR_ISOLATION:
+    try:
+        vector_store.purge_expired_chunks()
+        purge_expired_visitor_files()
+    except Exception as exc:  # noqa: BLE001 — never block startup
+        logger.warning("Visitor purge failed: %s", exc)
 if cleaned > 0:
     logger.info(
         "Cleaned up %d stale upload task(s) at startup",
@@ -378,6 +413,8 @@ async def shutdown_event():
     logger.info("DocLens shutting down...")
 
     await manager.shutdown_all()
+
+    vector_store.close()
 
     logger.info("DocLens shutdown complete.")
 

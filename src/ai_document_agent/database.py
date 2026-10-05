@@ -42,6 +42,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ai_document_agent.tenancy import current_visitor, is_default_visitor
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------
@@ -257,6 +259,33 @@ def init_db() -> None:
 # Session operations
 # ---------------------------------------------------------
 
+
+# ---------------------------------------------------------
+# Per-visitor session IDs
+# ---------------------------------------------------------
+#
+# Session IDs come from the browser, so with visitor
+# isolation on we store them prefixed with the visitor ID.
+# A visitor who sends someone else's session ID simply gets
+# a different, empty session of their own: there is no way
+# to name another visitor's row. The default (local)
+# visitor keeps unprefixed IDs, so existing history works.
+
+def _scope_session_id(session_id: str) -> str:
+    if is_default_visitor():
+        return session_id
+    return f"{current_visitor()}:{session_id}"
+
+
+def _unscope_session_id(session_id: str) -> str:
+    if is_default_visitor():
+        return session_id
+    prefix = f"{current_visitor()}:"
+    if session_id.startswith(prefix):
+        return session_id[len(prefix):]
+    return session_id
+
+
 def create_session(
     session_id: str | None = None,
     title: str = "New Chat",
@@ -281,6 +310,9 @@ def create_session(
     if session_id is None:
         session_id = str(uuid.uuid4())
 
+    public_id = session_id
+    session_id = _scope_session_id(session_id)
+
     now = datetime.now(timezone.utc).isoformat()
 
     conn = _get_connection()
@@ -302,7 +334,7 @@ def create_session(
         )
 
         return {
-            "id": session_id,
+            "id": public_id,
             "title": title,
             "source_filter": source_filter,
             "created_at": now,
@@ -320,6 +352,9 @@ def get_session(session_id: str) -> dict | None:
         Session dict, or None if not found.
     """
 
+    session_id = _scope_session_id(session_id)
+
+
     conn = _get_connection()
 
     try:
@@ -331,7 +366,9 @@ def get_session(session_id: str) -> dict | None:
         if row is None:
             return None
 
-        return dict(row)
+        session = dict(row)
+        session["id"] = _unscope_session_id(session["id"])
+        return session
 
     finally:
         conn.close()
@@ -359,19 +396,26 @@ def list_sessions(limit: int = 50) -> list[dict]:
     conn = _get_connection()
 
     try:
+        # Only this visitor's sessions (all of them for the
+        # default visitor, whose prefix is empty).
+        prefix = "" if is_default_visitor() else f"{current_visitor()}:"
         rows = conn.execute(
             """
             SELECT s.*,
                    (SELECT COUNT(*) FROM messages m
                     WHERE m.session_id = s.id) as message_count
             FROM sessions s
+            WHERE substr(s.id, 1, ?) = ?
             ORDER BY s.updated_at DESC
             LIMIT ?
             """,
-            (limit,),
+            (len(prefix), prefix, limit),
         ).fetchall()
 
-        return [dict(row) for row in rows]
+        sessions = [dict(row) for row in rows]
+        for session in sessions:
+            session["id"] = _unscope_session_id(session["id"])
+        return sessions
 
     finally:
         conn.close()
@@ -388,6 +432,9 @@ def delete_session(session_id: str) -> bool:
         True if the session was found and deleted,
         False if it didn't exist.
     """
+
+    session_id = _scope_session_id(session_id)
+
 
     conn = _get_connection()
 
@@ -434,6 +481,9 @@ def update_session_title(
     Returns:
         True if updated, False if session not found.
     """
+
+    session_id = _scope_session_id(session_id)
+
 
     # Truncate to 100 chars for display
     title = title[:100].strip()
@@ -503,6 +553,10 @@ def save_message(
         and created_at.
     """
 
+    public_id = session_id
+    session_id = _scope_session_id(session_id)
+
+
     now = datetime.now(timezone.utc).isoformat()
 
     conn = _get_connection()
@@ -559,7 +613,7 @@ def save_message(
 
         return {
             "id": message_id,
-            "session_id": session_id,
+            "session_id": public_id,
             "role": role,
             "content": content,
             "content_type": content_type,
@@ -600,6 +654,10 @@ def get_session_messages(
         the database — just not loaded into the UI.
     """
 
+    public_id = session_id
+    session_id = _scope_session_id(session_id)
+
+
     conn = _get_connection()
 
     try:
@@ -613,7 +671,10 @@ def get_session_messages(
             (session_id, limit),
         ).fetchall()
 
-        return [dict(row) for row in rows]
+        messages = [dict(row) for row in rows]
+        for message in messages:
+            message["session_id"] = public_id
+        return messages
 
     finally:
         conn.close()
