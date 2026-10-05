@@ -99,7 +99,7 @@ To get the one-word `deploy` command in Git Bash, add this to `~/.bashrc`:
 alias deploy='bash /e/ai-document-agent/deploy/local/deploy'
 ```
 
-From PowerShell, use `E:i-document-agent\deploy\local\deploy.ps1 ats`.
+From PowerShell, use `E:\ai-document-agent\deploy\local\deploy.ps1 ats`.
 
 ## Deploying by hand
 
