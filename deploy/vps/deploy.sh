@@ -40,8 +40,10 @@ fail() { log "FAILED: $*"; exit 1; }
 [[ "${sha:-}" =~ ^[0-9a-f]{7,40}$ ]] || { echo "invalid sha" >&2; exit 2; }
 
 case "$service" in
-    doclens) dir=doclens;    svc=doclens; image=doclens;    health=http://127.0.0.1:8300/health ;;
-    ats)     dir=ats-tailor; svc=ats;     image=ats-tailor; health=http://127.0.0.1:8100/health ;;
+    # svcs: containers restarted from the new image. expect: text the health
+    # response must contain (ATS reports whether its worker is running).
+    doclens) dir=doclens;    svc=doclens; svcs="doclens";        image=doclens;    health=http://127.0.0.1:8300/health; expect="" ;;
+    ats)     dir=ats-tailor; svc=ats;     svcs="ats ats-worker"; image=ats-tailor; health=http://127.0.0.1:8100/health; expect='"worker":"ok"' ;;
     site)    ;;
     *) echo "unknown service: $service" >&2; exit 2 ;;
 esac
@@ -62,8 +64,12 @@ chmod 755 "$incoming"
 tar -xf - -C "$incoming" || fail "could not unpack the uploaded tarball"
 
 wait_healthy() {
+    local body
     for _ in $(seq 1 45); do
-        curl -fsS -m 5 "$1" >/dev/null 2>&1 && return 0
+        if body=$(curl -fsS -m 5 "$1" 2>/dev/null) \
+            && [[ -z "${expect:-}" || "$body" == *"$expect"* ]]; then
+            return 0
+        fi
         sleep 2
     done
     return 1
@@ -110,7 +116,7 @@ deploy_app() {
 
     log "building $svc"
     if docker compose build "$svc" >>"$LOG" 2>&1 \
-        && docker compose up -d --no-deps "$svc" >>"$LOG" 2>&1 \
+        && docker compose up -d --no-deps $svcs >>"$LOG" 2>&1 \
         && wait_healthy "$health"; then
         log "deployed, healthy at $health"
     else
@@ -118,7 +124,7 @@ deploy_app() {
         rm -rf "$dir"
         mv "$dir.prev" "$dir"
         docker image tag "$image:prev" "$image:local" 2>/dev/null || true
-        docker compose up -d --no-deps --no-build --force-recreate "$svc" >>"$LOG" 2>&1 || true
+        docker compose up -d --no-deps --no-build --force-recreate $svcs >>"$LOG" 2>&1 || true
         if wait_healthy "$health"; then
             fail "deploy failed; previous version restored and healthy"
         fi

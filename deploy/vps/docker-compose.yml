@@ -69,6 +69,20 @@ services:
       - ats-data:/srv/data
     mem_limit: 1g
 
+  # Runs queued ATS checks with the local LLM; the ats API only queues them.
+  # Same image as ats; shares the ats-data volume, which holds the queue.
+  ats-worker:
+    image: ats-tailor:local
+    container_name: ats-tailor-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    env_file: ./ats.env
+    depends_on: [ollama]
+    volumes:
+      - ats-data:/srv/data
+    mem_limit: 1g
+    stop_grace_period: 90s
+
 volumes:
   ollama:
   doclens-uploads:
