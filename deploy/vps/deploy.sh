@@ -56,6 +56,9 @@ flock -w 900 9 || fail "another deploy is still running"
 
 incoming=$(mktemp -d "$APPS/.incoming.XXXXXX")
 trap 'rm -rf "$incoming"' EXIT
+# mktemp makes it 0700; the site copy below would carry that mode
+# onto the web root and Caddy could no longer read it.
+chmod 755 "$incoming"
 tar -xf - -C "$incoming" || fail "could not unpack the uploaded tarball"
 
 wait_healthy() {
