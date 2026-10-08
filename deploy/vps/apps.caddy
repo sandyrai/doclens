@@ -40,7 +40,7 @@ resume.ojasyukti.tech {
 	}
 }
 
-jobyukti.ojasyukti.tech {
+jobs.ojasyukti.tech {
 	encode zstd gzip
 
 	request_body {

@@ -2,7 +2,7 @@
 # Lives at ~/ojasyukti-apps on the VPS. Caddy proxies:
 #   doclens.ojasyukti.tech  -> 127.0.0.1:8300
 #   resume.ojasyukti.tech   -> 127.0.0.1:8100
-#   jobyukti.ojasyukti.tech -> 127.0.0.1:8200
+#   jobs.ojasyukti.tech     -> 127.0.0.1:8200 (the jobs app; product name not final)
 name: ojasyukti-apps
 
 services:
