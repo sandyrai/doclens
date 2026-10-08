@@ -4,6 +4,7 @@
 # ---------------------------------------------------------
 #
 #   deploy ats            test + deploy ATS Tailor
+#   deploy jobyukti       test + deploy JobYukti
 #   deploy doclens        test + deploy DocLens
 #   deploy site           check + deploy the ojasyukti.tech website
 #   deploy all            all three, stopping at the first failure
@@ -24,6 +25,7 @@ set -euo pipefail
 
 DOCLENS_DIR="${DOCLENS_DIR:-/e/ai-document-agent}"
 ATS_DIR="${ATS_DIR:-/c/Projects/ats-tailor}"
+JOBYUKTI_DIR="${JOBYUKTI_DIR:-/c/Projects/jobyukti}"
 SITE_DIR="${SITE_DIR:-/c/Projects/ojasyukti-site}"
 VPS="${VPS:-ojdeploy@93.127.185.236}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/ojasyukti-actions-deploy}"
@@ -47,7 +49,7 @@ services=()
 for arg in "$@"; do
     case "$arg" in
         --skip-tests) skip_tests=true ;;
-        ats|doclens|site) services+=("$arg") ;;
+        ats|doclens|site|jobyukti) services+=("$arg") ;;
         all) services+=(doclens ats site) ;;
         -h|--help) usage ;;
         *) echo "unknown argument: $arg"; usage ;;
@@ -60,6 +62,7 @@ repo_dir() {
     case "$1" in
         doclens) echo "$DOCLENS_DIR" ;;
         ats)     echo "$ATS_DIR" ;;
+        jobyukti) echo "$JOBYUKTI_DIR" ;;
         site)    echo "$SITE_DIR" ;;
     esac
 }
@@ -142,6 +145,29 @@ test_doclens() {
     else
         warn "Docker isn't running: the 8 pgvector tests will be SKIPPED (CI still runs them)"
         uv run pytest tests -q -p no:cacheprovider
+    fi
+}
+
+test_jobyukti() {
+    local py
+    py=$(python_bin)
+    if [[ -z "$py" ]]; then
+        step "creating JobYukti virtualenv"
+        python -m venv .venv
+        py=$(python_bin)
+    fi
+    "$py" -m pip install -q --disable-pip-version-check -r requirements-dev.txt
+    # The database tests use a throwaway database in the local dev container when Docker runs.
+    if docker info >/dev/null 2>&1; then
+        docker compose -f docker-compose.dev.yml up -d --wait db >/dev/null
+        docker compose -f docker-compose.dev.yml exec -T db psql -U jobyukti -d jobyukti -qtc \
+            "SELECT 1 FROM pg_database WHERE datname = 'jobyukti_test'" | grep -q 1 \
+            || docker compose -f docker-compose.dev.yml exec -T db createdb -U jobyukti jobyukti_test
+        TEST_DATABASE_URL="postgresql://jobyukti:jobyukti@127.0.0.1:5433/jobyukti_test" \
+            "$py" -m pytest tests -q -p no:cacheprovider
+    else
+        warn "Docker isn't running: JobYukti's database tests will be SKIPPED"
+        "$py" -m pytest tests -q -p no:cacheprovider
     fi
 }
 

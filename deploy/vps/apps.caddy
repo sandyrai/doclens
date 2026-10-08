@@ -39,3 +39,23 @@ resume.ojasyukti.tech {
 		X-Frame-Options "SAMEORIGIN"
 	}
 }
+
+jobyukti.ojasyukti.tech {
+	encode zstd gzip
+
+	request_body {
+		max_size 10MB
+	}
+
+	reverse_proxy 127.0.0.1:8200 {
+		transport http {
+			read_timeout 120s
+		}
+	}
+
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "SAMEORIGIN"
+	}
+}

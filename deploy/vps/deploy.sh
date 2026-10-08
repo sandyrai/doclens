@@ -12,6 +12,7 @@
 # Services:
 #   doclens  -> rebuild the doclens container   (health: :8300/health)
 #   ats      -> rebuild the ats-tailor container (health: :8100/health)
+#   jobyukti -> rebuild jobyukti + its worker      (health: :8200/health)
 #   site     -> copy files into /var/www/ojasyukti
 #
 # Apps roll back automatically (previous source + image) if the
@@ -36,7 +37,7 @@ log() {
 fail() { log "FAILED: $*"; exit 1; }
 
 [[ "${verb:-}" == "deploy" && -z "${extra:-}" ]] \
-    || { echo "usage: deploy <doclens|ats|site> <git-sha>" >&2; exit 2; }
+    || { echo "usage: deploy <doclens|ats|jobyukti|site> <git-sha>" >&2; exit 2; }
 [[ "${sha:-}" =~ ^[0-9a-f]{7,40}$ ]] || { echo "invalid sha" >&2; exit 2; }
 
 case "$service" in
@@ -44,6 +45,7 @@ case "$service" in
     # response must contain (ATS reports whether its worker is running).
     doclens) dir=doclens;    svc=doclens; svcs="doclens";        image=doclens;    health=http://127.0.0.1:8300/health; expect="" ;;
     ats)     dir=ats-tailor; svc=ats;     svcs="ats ats-worker"; image=ats-tailor; health=http://127.0.0.1:8100/health; expect='"worker":"ok"' ;;
+    jobyukti) dir=jobyukti;  svc=jobyukti; svcs="jobyukti jobyukti-worker"; image=jobyukti; health=http://127.0.0.1:8200/health; expect='"db":"ok"' ;;
     site)    ;;
     *) echo "unknown service: $service" >&2; exit 2 ;;
 esac

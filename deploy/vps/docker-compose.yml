@@ -1,7 +1,8 @@
-# OjasYukti AI apps: DocLens + ATS Tailor sharing one local Ollama.
+# OjasYukti AI apps: DocLens + ATS Tailor sharing one local Ollama, and JobYukti.
 # Lives at ~/ojasyukti-apps on the VPS. Caddy proxies:
-#   doclens.ojasyukti.tech -> 127.0.0.1:8300
-#   resume.ojasyukti.tech  -> 127.0.0.1:8100
+#   doclens.ojasyukti.tech  -> 127.0.0.1:8300
+#   resume.ojasyukti.tech   -> 127.0.0.1:8100
+#   jobyukti.ojasyukti.tech -> 127.0.0.1:8200
 name: ojasyukti-apps
 
 services:
@@ -83,6 +84,51 @@ services:
     mem_limit: 1g
     stop_grace_period: 90s
 
+  # JobYukti: its own small Postgres (data never shared with other apps), the
+  # web app, and a worker that fetches companies' jobs and re-scores users.
+  jobyukti-db:
+    image: postgres:17.6-alpine
+    container_name: jobyukti-db
+    restart: unless-stopped
+    env_file: ./jobyukti-db.env
+    volumes:
+      - jobyukti-pg:/var/lib/postgresql/data
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobyukti -d jobyukti"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  jobyukti:
+    build: ./jobyukti
+    image: jobyukti:local
+    container_name: jobyukti
+    restart: unless-stopped
+    env_file: ./jobyukti.env
+    depends_on:
+      jobyukti-db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8200:8200"
+    volumes:
+      - jobyukti-data:/srv/data
+    mem_limit: 768m
+
+  jobyukti-worker:
+    image: jobyukti:local
+    container_name: jobyukti-worker
+    restart: unless-stopped
+    command: ["python", "-m", "jobyukti", "worker"]
+    env_file: ./jobyukti.env
+    depends_on:
+      jobyukti-db:
+        condition: service_healthy
+    volumes:
+      - jobyukti-data:/srv/data
+    mem_limit: 512m
+    stop_grace_period: 30s
+
 volumes:
   ollama:
   doclens-uploads:
@@ -90,3 +136,5 @@ volumes:
   doclens-ocr:
   doclens-data:
   ats-data:
+  jobyukti-pg:
+  jobyukti-data:
