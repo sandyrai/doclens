@@ -19,7 +19,11 @@ COPY static ./static
 RUN uv sync --locked --no-dev
 
 # Runtime state lives next to src/ (the app resolves paths from there).
-RUN mkdir -p uploads chroma_db ocr_cache data
+# The app runs as an unprivileged user (uid/gid 10001) that owns only these folders.
+# The production volumes are handed to that uid before the first deploy of this image.
+RUN groupadd --system --gid 10001 app  && useradd --system --uid 10001 --gid app --create-home --home-dir /home/app app  && mkdir -p uploads chroma_db ocr_cache data  && chown -R app:app uploads chroma_db ocr_cache data /home/app
+ENV HOME=/home/app
+USER app
 
 ENV PATH="/srv/.venv/bin:$PATH"
 EXPOSE 8000

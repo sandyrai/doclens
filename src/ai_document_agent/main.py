@@ -197,6 +197,10 @@ app = FastAPI(
         "WebSocket API for wrapper applications"
     ),
     version="0.5.0",  # Bumped for Phase 5: Production Hardening
+    # No public /docs, /redoc or /openapi.json: they would map every route for an attacker.
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 
